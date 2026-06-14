@@ -43,6 +43,7 @@ from tqdm.auto import tqdm
 
 from ..utils.sampling import sample_token
 from ..utils.compile import CUDAGraphed
+from ..utils.profiling import profile_section
 from ..modules.streaming import StreamingStateDict, StreamingContainer, StreamingModule, load_streaming_state
 from ..modules.transformer import (
     StreamingTransformer,
@@ -836,7 +837,8 @@ class LMGen(StreamingModule[_LMGenState]):
         embeddings = None
         if return_embeddings:
             embeddings = self.lm_model.embed_codes(input_)
-        transformer_out, text_logits = state.graphed_main(input_)
+        with profile_section("temporal_transformer"):
+            transformer_out, text_logits = state.graphed_main(input_)
         output = self.process_transformer_output(
             transformer_out,
             text_logits,
@@ -891,10 +893,11 @@ class LMGen(StreamingModule[_LMGenState]):
 
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
-        if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
-        else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+        with profile_section("depformer"):
+            if self.return_logits:
+                sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            else:
+                sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
 
         state.provided[:, :, model_input_position] = False
         ####

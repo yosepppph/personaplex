@@ -57,6 +57,7 @@ from .models import loaders, LMGen, MimiModel
 from .models.lm import load_audio as lm_load_audio
 from .models.lm import _iterate_audio as lm_iterate_audio
 from .models.lm import encode_from_sphn as lm_encode_from_sphn
+from .utils.profiling import Profiler, set_profiler, profile_section
 
 
 def log(level: str, msg: str):
@@ -169,6 +170,8 @@ def run_inference(
     greedy: bool,
     save_voice_prompt_embeddings: bool,
     cpu_offload: bool = False,
+    profile: bool = False,
+    profile_warmup_frames: int = 8,
 ):
     """Run offline inference using an input WAV as the user-side stream.
 
@@ -264,6 +267,13 @@ def run_inference(
     generated_text_tokens: List[str] = []
     total_target_samples = user_audio.shape[-1]
 
+    prof: Optional[Profiler] = None
+    if profile:
+        prof = Profiler(device, frame_rate=mimi.frame_rate,
+                        warmup_frames=profile_warmup_frames)
+        set_profiler(prof)
+        log("info", f"profiling enabled (skipping first {profile_warmup_frames} frames)")
+
     for user_encoded in lm_encode_from_sphn(
         mimi,
         lm_iterate_audio(
@@ -274,13 +284,20 @@ def run_inference(
         # user_encoded: [1, K, T]. Feed one step at a time (usually T==1)
         steps = user_encoded.shape[-1]
         for c in range(steps):
+            if prof is not None:
+                prof.begin_frame()
             step_in = user_encoded[:, :, c : c + 1]
             # Feed user-side input channels; text + agent audio are sampled
-            tokens = lm_gen.step(step_in)
+            with profile_section("frame"):
+                tokens = lm_gen.step(step_in)
+                if tokens is not None:
+                    # Decode current sampled agent frame to PCM
+                    with profile_section("mimi_decode"):
+                        pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
+            if prof is not None:
+                prof.end_frame()
             if tokens is None:
                 continue
-            # Decode current sampled agent frame to PCM
-            pcm = decode_tokens_to_pcm(mimi, other_mimi, lm_gen, tokens)
             generated_frames.append(pcm)
             # Decode text token
             text_token = tokens[0, 0, 0].item()
@@ -315,7 +332,12 @@ def run_inference(
     # 12) Write text tokens
     with open(output_text, "w") as file:
         json.dump(generated_text_tokens, file, ensure_ascii=False)
-    log("info", f"Wrote output text to {output_text}")    
+    log("info", f"Wrote output text to {output_text}")
+
+    # 13) Emit profile summary (P0 baseline) and uninstall the profiler
+    if prof is not None:
+        prof.report()
+        set_profiler(None)
 
 
 def main():
@@ -381,6 +403,10 @@ def main():
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
     parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Measure per-frame latency, peak GPU memory, and RTF (P0 baseline).")
+    parser.add_argument("--profile-warmup-frames", type=int, default=8,
+                        help="Number of leading frames excluded from profile stats (default: 8).")
 
     args = parser.parse_args()
 
@@ -424,6 +450,8 @@ def main():
             greedy=greedy,
             save_voice_prompt_embeddings=False,
             cpu_offload=args.cpu_offload,
+            profile=args.profile,
+            profile_warmup_frames=args.profile_warmup_frames,
         )
 
 
