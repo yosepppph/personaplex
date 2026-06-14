@@ -267,6 +267,29 @@ class TurboQuantRingKVCache:
                                 positions)
         return KVCacheResult(scratch[0], scratch[1], positions)
 
+    def write_only(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Phase 2: quantize-and-store k, v into the ring WITHOUT dequantizing.
+
+        This is `complete()` minus the dequant-to-scratch block and minus the
+        position bookkeeping (the fused kernel masks via n_valid = min(
+        end_offset, capacity), valid because capacity == context here). Pair
+        with `turboquant_attention_triton(q, self)` / `_reference`, which read
+        the packed codes directly. QJL keys are not supported on this path.
+        """
+        assert not self.use_qjl_keys, "fused path does not support use_qjl_keys"
+        assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
+        B, H, T, D = k.shape
+        indexes = torch.arange(T, device=self.end_offset.device,
+                               dtype=self.end_offset.dtype) + self.end_offset
+        indexes = indexes % self.capacity
+        k_codes, k_nrm, _ = self._encode(k, self.cb_k, self.bnd_k)
+        v_codes, v_nrm, _ = self._encode(v, self.cb_v, self.bnd_v)
+        self.codes[0].index_copy_(2, indexes, k_codes)
+        self.codes[1].index_copy_(2, indexes, v_codes)
+        self.norms[0].index_copy_(2, indexes, k_nrm)
+        self.norms[1].index_copy_(2, indexes, v_nrm)
+        self.end_offset.add_(T)
+
     def asdict(self):
         d = {"codes": self.codes, "norms": self.norms,
              "end_offset": self.end_offset}
