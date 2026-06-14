@@ -44,6 +44,7 @@ class SlotState(Enum):
 class Slot:
     idx: int
     state: SlotState = SlotState.FREE
+    frames_since_join: int = 0
     in_q: "asyncio.Queue[np.ndarray]" = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     out_q: "asyncio.Queue[Tuple[np.ndarray, Optional[int]]]" = field(
         default_factory=lambda: asyncio.Queue(maxsize=64))
@@ -73,6 +74,16 @@ class BatchedEngine:
         self.mimi.streaming_forever(max_slots)
         self.lm_gen.streaming_forever(max_slots)
 
+        # A slot joining mid-stream is at the large shared global offset and so
+        # skips the normal start-of-conversation priming. For ~max_delay frames
+        # its delay pipeline is unfilled and the model emits SPECIAL tokens
+        # (>= card) into the audio channels -- valid for the LM but out of range
+        # for Mimi's codebook. We (1) clamp audio codes to [0, card) before
+        # decode so one slot's transient can't crash the shared batch, and
+        # (2) suppress that slot's output until it is primed.
+        self.audio_card = int(self.lm_gen.lm_model.card)
+        self.prime_frames = int(self.lm_gen.max_delay) + 2
+
         self.slots = [Slot(i) for i in range(max_slots)]
         self._silence = torch.zeros(max_slots, 1, self.frame_size,
                                     dtype=torch.float32, device=self.device)
@@ -97,6 +108,7 @@ class BatchedEngine:
         for slot in self.slots:
             if slot.state == SlotState.FREE:
                 self.lm_gen.reset_slot(slot.idx)
+                slot.frames_since_join = 0
                 # drain any stale items
                 for q in (slot.in_q, slot.out_q):
                     while not q.empty():
@@ -147,13 +159,22 @@ class BatchedEngine:
                 tokens = self.lm_gen.step(codes[:, :, c:c + 1])
                 if tokens is None:
                     continue
+                # Clamp acoustic codes into Mimi's codebook range: a slot still in
+                # its join priming window can emit special tokens (>= card) that
+                # would otherwise crash the shared-batch decode.
+                audio_codes = tokens[:, 1:9].clamp(0, self.audio_card - 1)
                 with profile_section("mimi_decode"):
-                    pcm_out = self.mimi.decode(tokens[:, 1:9])  # [N,1,frame_size]
+                    pcm_out = self.mimi.decode(audio_codes)  # [N,1,frame_size]
                 pcm_out_cpu = pcm_out.cpu().numpy()
                 text_tokens = tokens[:, 0, 0].cpu().numpy()
                 for idx in active:
                     slot = self.slots[idx]
                     if slot.state != SlotState.ACTIVE:
+                        continue
+                    slot.frames_since_join += 1
+                    # Suppress priming-window output (garbage until the slot's
+                    # delay pipeline fills with its own tokens).
+                    if slot.frames_since_join <= self.prime_frames:
                         continue
                     try:
                         slot.out_q.put_nowait(
