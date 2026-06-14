@@ -32,6 +32,7 @@ See `StreamingTransformer` for more information.
 
 from contextlib import ExitStack
 from dataclasses import dataclass
+import os
 import typing as tp
 
 from einops import rearrange
@@ -381,9 +382,30 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         # TODO: the following estimation will not work great with FSDP.
         dtype = self.in_proj_weight.dtype
         dim_per_head = self.embed_dim // self.num_heads
-        kv_cache = RingKVCache(
-            batch_size, self.num_heads, dim_per_head, capacity, device, dtype
+        # P2: optionally use the TurboQuant 4-bit KV cache for the large-context
+        # temporal transformer only. Gated by PERSONAPLEX_TURBOQUANT_KV so it is
+        # a no-op by default and trivially A/B-tested against the bf16 baseline.
+        # The depformer attention has context=None (capacity from weights_per_step,
+        # =8), so the `self.context is not None and self.context > 256` guard keeps
+        # it on the unmodified bf16 RingKVCache.
+        use_turboquant = (
+            os.environ.get("PERSONAPLEX_TURBOQUANT_KV", "0") == "1"
+            and self.context is not None
+            and self.context > 256
         )
+        if use_turboquant:
+            # Lazy import: turboquant_ring_kv_cache imports KVCacheResult from this
+            # module, so a top-level import here would be circular.
+            from .turboquant_ring_kv_cache import TurboQuantRingKVCache
+            use_qjl = os.environ.get("PERSONAPLEX_TURBOQUANT_QJL", "0") == "1"
+            kv_cache = TurboQuantRingKVCache(
+                batch_size, self.num_heads, dim_per_head, capacity, device, dtype,
+                bits=4, rotation="haar", use_qjl_keys=use_qjl,
+            )
+        else:
+            kv_cache = RingKVCache(
+                batch_size, self.num_heads, dim_per_head, capacity, device, dtype
+            )
         return _MHAState(
             kv_cache,
             offset=torch.zeros(1, device=device, dtype=torch.long),

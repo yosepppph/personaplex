@@ -53,7 +53,7 @@ import typing as tp
 
 import torch
 
-from moshi.modules.transformer import KVCacheResult  # upstream named tuple
+from .transformer import KVCacheResult  # upstream named tuple
 
 
 # ----------------------------------------------------------------------------

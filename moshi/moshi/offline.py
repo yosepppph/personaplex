@@ -189,6 +189,14 @@ def run_inference(
     # No worries about double-counting since config.json will be cached the second time
     hf_hub_download(hf_repo, "config.json")
 
+    # P2: surface whether the TurboQuant 4-bit KV cache is active for this run.
+    if os.environ.get("PERSONAPLEX_TURBOQUANT_KV", "0") == "1":
+        _qjl = os.environ.get("PERSONAPLEX_TURBOQUANT_QJL", "0") == "1"
+        log("info", f"TurboQuant 4-bit KV cache ENABLED (qjl_keys={_qjl}) "
+                    "for the temporal transformer")
+    else:
+        log("info", "TurboQuant KV cache disabled (bf16 RingKVCache baseline)")
+
     # 1) Load Mimi encoders/decoders (same as server.py)
     log("info", "loading mimi")
     if mimi_weight is None:
