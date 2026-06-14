@@ -15,17 +15,25 @@ LMGen.reset_slot on join, so the shared global step counter is harmless (RoPE is
 relative). The fused TurboQuant attention is required for ragged per-slot
 offsets, so the engine asserts it is enabled.
 
+Concurrency model: the GPU step runs in a dedicated worker THREAD via
+run_in_executor, so the asyncio event loop stays responsive to all clients'
+socket I/O while the GPU is busy (a ~50 ms inline tick would otherwise stall
+every client each frame). asyncio.Queue access and slot-state mutations
+(join/leave/reset) happen only on the event loop, between executor calls, so
+they never race with the in-flight GPU step.
+
 This module is transport-agnostic: connections push PCM frames with submit_pcm()
 and read results from a slot's output queue. Phase 4 wires WebSockets to it.
 Phase 3 will add per-slot voice/text prompt injection on join.
 """
 
 import asyncio
+import concurrent.futures
 import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,9 +43,10 @@ from .utils.profiling import profile_section
 
 
 class SlotState(Enum):
-    FREE = 0
-    ACTIVE = 1
-    CLOSING = 2
+    FREE = 0       # available
+    PENDING = 1    # reserved by a new connection; reset happens on the loop next tick
+    ACTIVE = 2     # streaming
+    CLOSING = 3
 
 
 @dataclass
@@ -87,6 +96,9 @@ class BatchedEngine:
         self.slots = [Slot(i) for i in range(max_slots)]
         self._silence = torch.zeros(max_slots, 1, self.frame_size,
                                     dtype=torch.float32, device=self.device)
+        # All GPU work runs on this single dedicated thread (one CUDA stream,
+        # consistent CUDA-graph replay), off the asyncio event loop.
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._running = False
         self._tick_count = 0
         self._tick_ms_ewma = 0.0
@@ -101,22 +113,23 @@ class BatchedEngine:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
 
-    # ---------------- slot lifecycle ----------------
+    # ---------------- slot lifecycle (event loop only) ----------------
 
     def acquire(self) -> Optional[int]:
-        """Assign a FREE slot to a new connection, or None if the engine is full."""
+        """Reserve a FREE slot for a new connection, or None if the engine is full.
+
+        The slot is marked PENDING; the actual model reset happens on the engine
+        loop (between GPU steps) so it never races with an in-flight step.
+        """
         for slot in self.slots:
             if slot.state == SlotState.FREE:
-                self.lm_gen.reset_slot(slot.idx)
-                slot.frames_since_join = 0
-                # drain any stale items
+                slot.state = SlotState.PENDING
                 for q in (slot.in_q, slot.out_q):
                     while not q.empty():
                         try:
                             q.get_nowait()
                         except asyncio.QueueEmpty:
                             break
-                slot.state = SlotState.ACTIVE
                 return slot.idx
         return None
 
@@ -134,13 +147,20 @@ class BatchedEngine:
     def active_count(self) -> int:
         return sum(s.state == SlotState.ACTIVE for s in self.slots)
 
-    # ---------------- the batched tick ----------------
+    def _process_joins(self):
+        """Promote PENDING slots to ACTIVE, resetting their model state. Runs on
+        the event loop between GPU steps, so it never races with _compute."""
+        for slot in self.slots:
+            if slot.state == SlotState.PENDING:
+                self.lm_gen.reset_slot(slot.idx)
+                slot.frames_since_join = 0
+                slot.state = SlotState.ACTIVE
 
-    @torch.no_grad()
-    def _tick(self):
-        # Gather one input frame per slot (silence when a slot is idle/quiet).
+    # ---------------- tick split: gather (loop) / compute (thread) / scatter (loop) ----------------
+
+    def _gather_inputs(self) -> Tuple[torch.Tensor, List[int]]:
         batch = self._silence.clone()
-        active = []
+        active: List[int] = []
         for slot in self.slots:
             if slot.state == SlotState.ACTIVE:
                 active.append(slot.idx)
@@ -150,62 +170,79 @@ class BatchedEngine:
                         batch[slot.idx, 0] = torch.from_numpy(pcm).to(self.device)
                     except asyncio.QueueEmpty:
                         pass  # quiet this frame -> silence
-        if not active:
-            return  # nothing to do; skip GPU work entirely
+        return batch, active
 
+    @torch.no_grad()
+    def _compute(self, batch: torch.Tensor):
+        """GPU step. Runs in the worker thread. Touches no asyncio.Queue."""
         with profile_section("frame"):
             codes = self.mimi.encode(batch)
+            tokens = None
             for c in range(codes.shape[-1]):
                 tokens = self.lm_gen.step(codes[:, :, c:c + 1])
-                if tokens is None:
-                    continue
-                # Clamp acoustic codes into Mimi's codebook range: a slot still in
-                # its join priming window can emit special tokens (>= card) that
-                # would otherwise crash the shared-batch decode.
-                audio_codes = tokens[:, 1:9].clamp(0, self.audio_card - 1)
-                with profile_section("mimi_decode"):
-                    pcm_out = self.mimi.decode(audio_codes)  # [N,1,frame_size]
-                pcm_out_cpu = pcm_out.cpu().numpy()
-                text_tokens = tokens[:, 0, 0].cpu().numpy()
-                for idx in active:
-                    slot = self.slots[idx]
-                    if slot.state != SlotState.ACTIVE:
-                        continue
-                    slot.frames_since_join += 1
-                    # Suppress priming-window output (garbage until the slot's
-                    # delay pipeline fills with its own tokens).
-                    if slot.frames_since_join <= self.prime_frames:
-                        continue
-                    try:
-                        slot.out_q.put_nowait(
-                            (pcm_out_cpu[idx, 0], int(text_tokens[idx])))
-                    except asyncio.QueueFull:
-                        pass  # consumer fell behind; drop oldest by skipping
+            if tokens is None:
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                return None
+            # Clamp acoustic codes into Mimi's codebook range: a slot still in its
+            # join priming window can emit special tokens (>= card) that would
+            # otherwise crash the shared-batch decode.
+            audio_codes = tokens[:, 1:9].clamp(0, self.audio_card - 1)
+            with profile_section("mimi_decode"):
+                pcm_out = self.mimi.decode(audio_codes)  # [N,1,frame_size]
+            pcm_out_cpu = pcm_out.cpu().numpy()
+            text_tokens = tokens[:, 0, 0].cpu().numpy()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        return pcm_out_cpu, text_tokens
+
+    def _scatter(self, active: List[int], result):
+        if result is None:
+            return
+        pcm_out_cpu, text_tokens = result
+        for idx in active:
+            slot = self.slots[idx]
+            if slot.state != SlotState.ACTIVE:
+                continue  # released mid-step; drop its output
+            slot.frames_since_join += 1
+            # Suppress priming-window output (garbage until the slot's delay
+            # pipeline fills with its own tokens).
+            if slot.frames_since_join <= self.prime_frames:
+                continue
+            try:
+                slot.out_q.put_nowait((pcm_out_cpu[idx, 0], int(text_tokens[idx])))
+            except asyncio.QueueFull:
+                pass  # consumer fell behind; drop this frame
 
     # ---------------- async run loop ----------------
 
     async def run(self):
         """Run the engine forever at the frame cadence. Launch as a task."""
         self._running = True
+        loop = asyncio.get_running_loop()
         next_t = time.monotonic()
         while self._running:
             t0 = time.monotonic()
-            self._tick()
-            if self.device.type == "cuda":
-                torch.cuda.synchronize()
-            dt = time.monotonic() - t0
-            self._tick_count += 1
-            self._tick_ms_ewma = 0.95 * self._tick_ms_ewma + 0.05 * dt * 1000
+            self._process_joins()                 # event loop
+            batch, active = self._gather_inputs()  # event loop
+            if active:
+                # GPU work off the event loop; loop services clients meanwhile.
+                result = await loop.run_in_executor(self._executor, self._compute, batch)
+                self._scatter(active, result)      # event loop
+                dt = time.monotonic() - t0
+                self._tick_count += 1
+                self._tick_ms_ewma = 0.95 * self._tick_ms_ewma + 0.05 * dt * 1000
             # Maintain real-time cadence; yield to client coroutines in the gap.
             next_t += self.frame_period
             sleep = next_t - time.monotonic()
             if sleep < 0:
-                next_t = time.monotonic()  # we fell behind; resync
+                next_t = time.monotonic()  # fell behind; resync
                 sleep = 0
             await asyncio.sleep(sleep)
 
     def stop(self):
         self._running = False
+        self._executor.shutdown(wait=False)
 
     def stats(self) -> dict:
         return {
