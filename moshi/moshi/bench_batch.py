@@ -99,13 +99,16 @@ def run_bench(batch_sizes: List[int], frames: int, warmup_frames: int,
     results = []
     for B in batch_sizes:
         log("info", f"=== batch size {B} ===")
-        # Fresh streaming state at batch B.
-        lm_gen = LMGen(lm, device=device, sample_rate=mimi.sample_rate,
-                       frame_rate=frame_rate)
-        mimi.streaming_forever(B)
-        lm_gen.streaming_forever(B)
-
+        lm_gen = None
         try:
+            # Fresh streaming state at batch B. Inside the try so an OOM while
+            # allocating the KV cache is caught and reported (and the sweep can
+            # stop cleanly) instead of crashing before the summary prints.
+            lm_gen = LMGen(lm, device=device, sample_rate=mimi.sample_rate,
+                           frame_rate=frame_rate)
+            mimi.streaming_forever(B)
+            lm_gen.streaming_forever(B)
+
             # Warmup: prime CUDA graphs + delay buffers at this batch size.
             _drive_frames(mimi, lm_gen, B, frame_size, device,
                           warmup_frames + max(int(lm_gen.max_delay), 0) + 2, prof=None)
@@ -135,24 +138,32 @@ def run_bench(batch_sizes: List[int], frames: int, warmup_frames: int,
                 "peak_gib": peak_gib,
                 "realtime": rtf < 1.0,
             })
+            stop_sweep = False
         except RuntimeError as e:
             set_profiler(None)
             msg = str(e).split("\n")[0]
+            is_oom = "out of memory" in msg.lower()
             log("error", f"batch {B} failed: {msg}")
-            results.append({"B": B, "oom": "out of memory" in msg.lower(), "error": msg})
+            results.append({"B": B, "oom": is_oom, "error": msg})
+            # Larger batch sizes will only need more memory, so stop on OOM.
+            stop_sweep = is_oom
         finally:
             # Drop streaming state to free KV caches before the next batch size.
             # Guarded: a mid-init OOM can leave state partially set, and
             # reset_streaming() would raise on the un-set modules, masking the
             # real error. _stop_streaming just nulls state everywhere.
             try:
-                lm_gen._stop_streaming()
+                if lm_gen is not None:
+                    lm_gen._stop_streaming()
                 mimi._stop_streaming()
             except Exception:
                 pass
             del lm_gen
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        if stop_sweep:
+            log("info", f"stopping sweep at batch {B} (OOM); larger batches would also OOM")
+            break
 
     # ---- scaling summary ----
     print("\n" + "=" * 86)
