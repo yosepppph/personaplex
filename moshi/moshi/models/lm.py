@@ -723,6 +723,36 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
         return _LMGenState(cache, provided, initial, graphed_main, graphed_embeddings, graphed_depth)
+
+    @torch.no_grad()
+    def reset_slot(self, b: int) -> None:
+        """Reset a single batch slot to a fresh conversation (continuous batching).
+
+        Used when a new user takes slot `b` while other slots keep streaming.
+        The global step counter (`state.offset`) is shared and keeps running —
+        per-slot independence comes from resetting this slot's temporal KV cache
+        timeline (end_offset[b] -> 0, via each attention's RingKVCache.reset_slot)
+        plus its short token-delay buffer. RoPE is relative, so the large shared
+        offset is harmless; the slot's attention only ever sees frames written
+        after this reset.
+        """
+        state = self._streaming_state
+        if state is None:
+            raise RuntimeError("reset_slot requires active streaming state")
+        # Seed the slot's delay buffer with the (valid) initial token rather than
+        # the ungenerated sentinel: a late-joining slot is at a large shared
+        # offset and skips the offset<=delay seeding, so any position read before
+        # being generated must already hold a valid token.
+        state.cache[b] = state.initial[0]      # [K,1] broadcast over the buffer
+        state.provided[b] = False
+        # Reset the per-slot temporal KV timeline in every attention module that
+        # supports it (the TurboQuant fused cache); depformer's tiny within-frame
+        # cache carries no cross-frame conversation state, so it is left alone.
+        for module in self.lm_model.modules():
+            mstate = getattr(module, "_streaming_state", None)
+            kv = getattr(mstate, "kv_cache", None) if mstate is not None else None
+            if kv is not None and hasattr(kv, "reset_slot"):
+                kv.reset_slot(b)
     
     @torch.no_grad()
     def prepare_step_input(self,
