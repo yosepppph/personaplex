@@ -78,7 +78,12 @@ def run_bench(batch_sizes: List[int], frames: int, warmup_frames: int,
               device: str, hf_repo: str, moshi_weight: Optional[str],
               mimi_weight: Optional[str], cpu_offload: bool):
     turbo = os.environ.get("PERSONAPLEX_TURBOQUANT_KV", "0") == "1"
-    log("info", f"TurboQuant KV cache: {'ENABLED (4-bit)' if turbo else 'disabled (bf16)'}")
+    fused = os.environ.get("PERSONAPLEX_TURBOQUANT_FUSED", "0") == "1"
+    if turbo:
+        log("info", f"TurboQuant KV cache: ENABLED (4-bit, "
+                    f"{'fused kernel' if fused else 'phase-1 dequant'})")
+    else:
+        log("info", "TurboQuant KV cache: disabled (bf16)")
 
     # Load Mimi + LM once; only streaming state is rebuilt per batch size.
     hf_hub_download(hf_repo, "config.json")

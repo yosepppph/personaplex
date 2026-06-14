@@ -45,6 +45,28 @@ from .gating import make_gating
 from .rope import RotaryEmbedding
 from .streaming import StreamingModule, StreamingContainer
 
+# TurboQuant Phase 2 fused decode attention. Safe to import at module load:
+# turboquant_attention imports neither this module nor the cache, so there is no
+# circular dependency, and it handles a missing Triton gracefully.
+try:
+    from .turboquant_attention import (
+        turboquant_attention_triton,
+        turboquant_attention_reference,
+        HAS_TRITON as _TQ_HAS_TRITON,
+    )
+    _HAS_TQ_ATTN = True
+except Exception:  # pragma: no cover - defensive; should not happen
+    _HAS_TQ_ATTN = False
+
+
+def _tq_fused_enabled() -> bool:
+    """Phase 2 fused attention is opt-in and requires the quantized KV cache."""
+    return (
+        _HAS_TQ_ATTN
+        and os.environ.get("PERSONAPLEX_TURBOQUANT_KV", "0") == "1"
+        and os.environ.get("PERSONAPLEX_TURBOQUANT_FUSED", "0") == "1"
+    )
+
 
 class LayerNormF32(nn.LayerNorm):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -444,19 +466,38 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         if self.rope:
             q, k = self.rope(q, k, offset, time_before_heads=False)
 
-        k, v, pos_k = self._complete_kv(k, v)
-        if self.causal:
-            pos_k = pos_k.view(1, -1)
-            pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(
-                -1, 1
-            )
-            delta = pos_q - pos_k
-            attn_bias = (pos_k >= 0) & (delta >= 0)
-            if self.context is not None:
-                attn_bias = attn_bias & (delta < self.context)
+        # Phase 2: fused decode attention straight from the packed 4-bit codes,
+        # no dequantize-to-HBM. Only on the streaming single-token causal path
+        # with the TurboQuant cache (detected by write_only); falls back to the
+        # bf16 / phase-1 path for prefill (T>1) or the plain RingKVCache. Masking
+        # (n_valid = min(end_offset, capacity)) is exact here because capacity ==
+        # context for the temporal transformer.
+        use_fused = (
+            state is not None
+            and T == 1
+            and self.causal
+            and _tq_fused_enabled()
+            and hasattr(state.kv_cache, "write_only")
+        )
+        if use_fused:
+            state.kv_cache.write_only(k, v)
+            _attn = (turboquant_attention_triton if _TQ_HAS_TRITON
+                     else turboquant_attention_reference)
+            x = _attn(q, state.kv_cache)
         else:
-            attn_bias = None
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+            k, v, pos_k = self._complete_kv(k, v)
+            if self.causal:
+                pos_k = pos_k.view(1, -1)
+                pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(
+                    -1, 1
+                )
+                delta = pos_q - pos_k
+                attn_bias = (pos_k >= 0) & (delta >= 0)
+                if self.context is not None:
+                    attn_bias = attn_bias & (delta < self.context)
+            else:
+                attn_bias = None
+            x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
 
         x = rearrange(x, "b h t d -> b t (h d)")
         if self.weights_per_step:

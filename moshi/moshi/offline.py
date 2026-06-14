@@ -192,8 +192,10 @@ def run_inference(
     # P2: surface whether the TurboQuant 4-bit KV cache is active for this run.
     if os.environ.get("PERSONAPLEX_TURBOQUANT_KV", "0") == "1":
         _qjl = os.environ.get("PERSONAPLEX_TURBOQUANT_QJL", "0") == "1"
-        log("info", f"TurboQuant 4-bit KV cache ENABLED (qjl_keys={_qjl}) "
-                    "for the temporal transformer")
+        _fused = os.environ.get("PERSONAPLEX_TURBOQUANT_FUSED", "0") == "1"
+        _mode = "fused kernel (phase 2)" if _fused else "dequant+SDPA (phase 1)"
+        log("info", f"TurboQuant 4-bit KV cache ENABLED (qjl_keys={_qjl}, "
+                    f"mode={_mode}) for the temporal transformer")
     else:
         log("info", "TurboQuant KV cache disabled (bf16 RingKVCache baseline)")
 

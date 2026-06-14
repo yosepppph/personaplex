@@ -86,11 +86,15 @@ if HAS_TRITON:
         KN, VN,        # (B*H, C)  f16   per-vector norms
         CBK, CBV,      # (16,) f32 codebooks (tiny; stays L1/L2 resident)
         OUT,           # (B*H, D)  f32   rotated-domain accumulator output
-        n_valid,       # i32: min(end_offset, C)
+        END_OFFSET,    # i64 ptr [1]: cache.end_offset; n_valid = min(., C).
+                       # Read on-device (not via .item()) so the launch is
+                       # legal inside a CUDA graph and tracks the in-place
+                       # end_offset.add_() done by write_only each step.
         C: tl.constexpr, D: tl.constexpr, HALF_D: tl.constexpr,
         BLOCK_C: tl.constexpr, SM_SCALE: tl.constexpr,
     ):
         pid = tl.program_id(0)                       # one program per (b, h)
+        n_valid = tl.minimum(tl.load(END_OFFSET), C).to(tl.int32)
         dh = tl.arange(0, HALF_D)
         qe = tl.load(QR + pid * D + 2 * dh)          # q at even coords
         qo = tl.load(QR + pid * D + 2 * dh + 1)      # q at odd coords
@@ -143,14 +147,15 @@ def turboquant_attention_triton(q, cache, sm_scale=None, block_c: int = 128):
     sm_scale = sm_scale or 1.0 / math.sqrt(D)
     qr = (q.float() @ cache.rot.T).reshape(B * H, D).contiguous()
     out = torch.empty_like(qr)
-    n_valid = int(min(cache.end_offset.item(), C))
+    # Pass the persistent end_offset tensor (no host sync): the kernel computes
+    # n_valid = min(end_offset, C) on-device, so this is CUDA-graph-safe.
     _tq_decode_attn_kernel[(B * H,)](
         qr,
         cache.codes[0].reshape(B * H, C, D // 2),
         cache.codes[1].reshape(B * H, C, D // 2),
         cache.norms[0].reshape(B * H, C),
         cache.norms[1].reshape(B * H, C),
-        cache.cb_k, cache.cb_v, out, n_valid,
+        cache.cb_k, cache.cb_v, out, cache.end_offset,
         C=C, D=D, HALF_D=D // 2, BLOCK_C=block_c, SM_SCALE=sm_scale,
     )
     # single inverse rotation per (b, h)
