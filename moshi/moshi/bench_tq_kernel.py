@@ -57,10 +57,13 @@ def _dequant_sdpa(q, cache):
     vrot = unpack(cache.codes[1], cache.cb_v, cache.norms[1].float())
     k = (krot @ cache.rot).to(q.dtype)   # back to original domain
     v = (vrot @ cache.rot).to(q.dtype)
-    n_valid = int(min(cache.end_offset.item(), C))
-    bias = torch.zeros(C, device=q.device)
-    bias[n_valid:] = float("-inf")
-    return F.scaled_dot_product_attention(q, k, v, bias.view(1, 1, 1, C))
+    # per-slot validity mask (B,1,1,C): slot b attends only its first end_offset[b]
+    n_valid = torch.clamp(cache.end_offset, max=C)             # (B,)
+    ar = torch.arange(C, device=q.device)
+    invalid = ar[None, :] >= n_valid[:, None]                  # (B, C)
+    bias = torch.zeros(q.shape[0], C, device=q.device)
+    bias.masked_fill_(invalid, float("-inf"))
+    return F.scaled_dot_product_attention(q, k, v, bias.view(q.shape[0], 1, 1, C))
 
 
 def _time_ms(fn, iters=50, warmup=10):
@@ -112,6 +115,38 @@ def run(batch_sizes, H, D, capacity, fill, device):
             speedup = t_phase1 / t_fused if t_fused > 0 else float("nan")
             print(f"        fused={t_fused:.3f} ms  phase1(dequant+SDPA)="
                   f"{t_phase1:.3f} ms  speedup={speedup:.2f}x")
+        del cache, q
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ---- ragged per-slot offset test (continuous-batching foundation) ----
+    # Give each slot a DIFFERENT end_offset and confirm the fused kernel still
+    # matches the per-slot reference. This is what lets users join/leave at
+    # different times: slot b attends only its own first end_offset[b] frames.
+    if len(batch_sizes) and max(batch_sizes) >= 2:
+        Br = max(b for b in batch_sizes if b >= 2)
+        print(f"ragged per-slot offset test (B={Br}): "
+              "each slot a different timeline")
+        cache = TurboQuantRingKVCache(Br, H, D, capacity, torch.device(device),
+                                      torch.bfloat16, bits=4, rotation="haar",
+                                      use_qjl_keys=False)
+        _fill_cache(cache, Br, H, D, fill, device)
+        # spread offsets: full, ~half, ~quarter, tiny, ... across slots
+        ragged = [capacity, capacity // 2, capacity // 4, 7][:Br]
+        while len(ragged) < Br:
+            ragged.append((capacity // (len(ragged) + 1)))
+        cache.end_offset = torch.tensor(ragged[:Br], device=device, dtype=torch.long)
+        q = torch.randn(Br, H, 1, D, device=device)
+        ref = tqa.turboquant_attention_reference(q, cache)
+        truth = _dequant_sdpa(q, cache)
+        rt = (ref.float() - truth.float()).abs().max().item()
+        line = f"  end_offset={ragged[:Br]}  reference-vs-bf16SDPA max|d|={rt:.2e}"
+        if tqa.HAS_TRITON:
+            out = tqa.turboquant_attention_triton(q, cache)
+            kr = (out.float() - ref.float()).abs().max().item()
+            line += f"  kernel-vs-reference max|d|={kr:.2e}"
+            line += "  [PASS]" if kr < 2e-3 else "  [FAIL]"
+        print(line)
         del cache, q
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

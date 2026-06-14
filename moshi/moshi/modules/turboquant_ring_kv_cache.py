@@ -134,6 +134,7 @@ class TurboQuantRingKVCache:
         assert bits == 4, "packing below assumes two 4-bit codes per byte"
         D = dim_per_head
         self.capacity, self.dtype, self.bits = capacity, dtype, bits
+        self.batch_size, self.num_heads = batch_size, num_heads
         self.use_qjl_keys = use_qjl_keys
         self.rotation = rotation
 
@@ -167,7 +168,11 @@ class TurboQuantRingKVCache:
             self.k_res_norm = torch.zeros((batch_size, num_heads, capacity),
                                           device=device, dtype=torch.float16)
 
-        self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        # Per-slot offset (B,): each batch slot has an INDEPENDENT timeline so
+        # users can join/leave at different times (continuous batching). With all
+        # slots synchronized (the single-user server, the batch benchmark) every
+        # entry is equal and behaviour is identical to a shared scalar offset.
+        self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
 
     # ---------------- core transforms ----------------
 
@@ -208,14 +213,32 @@ class TurboQuantRingKVCache:
     # ---------------- public API (mirrors upstream RingKVCache) ----------------
 
     def reset(self):
+        """Reset every slot's timeline (whole batch)."""
         self.end_offset.zero_()
 
+    def reset_slot(self, b: int) -> None:
+        """Reset a single slot's timeline to 0 (a new user takes slot b).
+
+        No scrubbing needed: the per-slot n_valid = min(end_offset[b], capacity)
+        masks every position >= end_offset[b], so the previous occupant's
+        leftover codes are never attended to until b overwrites them.
+        """
+        self.end_offset[b] = 0
+
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
+        # Phase-1 (dequant -> SDPA) fallback path. Per-slot ragged offsets are
+        # only supported on the fused path (write_only); here we require the
+        # batch to be synchronized so the shared-offset position math is valid.
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
+        assert bool((self.end_offset == self.end_offset[0]).all()), (
+            "complete() requires a synchronized batch; use the fused path "
+            "(PERSONAPLEX_TURBOQUANT_FUSED=1) for ragged per-slot offsets."
+        )
+        eo = self.end_offset[:1]  # representative scalar-shaped offset
 
         indexes = torch.arange(T, device=self.end_offset.device,
-                               dtype=self.end_offset.dtype) + self.end_offset
+                               dtype=self.end_offset.dtype) + eo
         indexes = indexes % self.capacity
 
         k_codes, k_nrm, k_res = self._encode(k, self.cb_k, self.bnd_k)
@@ -233,7 +256,7 @@ class TurboQuantRingKVCache:
             self.k_res_norm.index_copy_(2, indexes,
                                         k_res.norm(dim=-1).to(torch.float16))
 
-        self.end_offset.add_(T)
+        self.end_offset.add_(T)  # all slots (synchronized) advance together
 
         # dequantize-on-read into shared scratch (phase 1)
         skey = (self.codes.device, B, H, self.capacity, D, self.dtype)
@@ -255,14 +278,14 @@ class TurboQuantRingKVCache:
                     * (math.sqrt(math.pi / 2) / D) * (z @ self.S))
             scratch[0].add_(self._unrotate(corr).to(self.dtype))
 
-        # position bookkeeping: identical to upstream
+        # position bookkeeping: identical to upstream (synchronized => use eo)
         idx_all = torch.arange(self.capacity, device=self.end_offset.device,
                                dtype=torch.long)
-        invalid = idx_all >= self.end_offset
-        end_index = self.end_offset % self.capacity
+        invalid = idx_all >= eo
+        end_index = eo % self.capacity
         delta = idx_all - end_index
-        positions = torch.where(delta <= 0, self.end_offset + delta,
-                                self.end_offset + delta - self.capacity)
+        positions = torch.where(delta <= 0, eo + delta,
+                                eo + delta - self.capacity)
         positions = torch.where(invalid, torch.full_like(positions, -1),
                                 positions)
         return KVCacheResult(scratch[0], scratch[1], positions)
@@ -279,16 +302,19 @@ class TurboQuantRingKVCache:
         assert not self.use_qjl_keys, "fused path does not support use_qjl_keys"
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
-        indexes = torch.arange(T, device=self.end_offset.device,
-                               dtype=self.end_offset.dtype) + self.end_offset
-        indexes = indexes % self.capacity
-        k_codes, k_nrm, _ = self._encode(k, self.cb_k, self.bnd_k)
+        assert T == 1, "streaming write_only handles one frame at a time (T==1)"
+        k_codes, k_nrm, _ = self._encode(k, self.cb_k, self.bnd_k)  # (B,H,1,Dh),(B,H,1)
         v_codes, v_nrm, _ = self._encode(v, self.cb_v, self.bnd_v)
-        self.codes[0].index_copy_(2, indexes, k_codes)
-        self.codes[1].index_copy_(2, indexes, v_codes)
-        self.norms[0].index_copy_(2, indexes, k_nrm)
-        self.norms[1].index_copy_(2, indexes, v_nrm)
-        self.end_offset.add_(T)
+        # Per-slot write position: each slot writes at its OWN ring position
+        # (end_offset[b] % C). When the batch is synchronized these are all equal
+        # and this matches the previous shared index_copy_ exactly.
+        write_pos = self.end_offset % self.capacity                # (B,)
+        bidx = torch.arange(B, device=write_pos.device)
+        self.codes[0][bidx, :, write_pos, :] = k_codes[:, :, 0, :]
+        self.codes[1][bidx, :, write_pos, :] = v_codes[:, :, 0, :]
+        self.norms[0][bidx, :, write_pos] = k_nrm[:, :, 0]
+        self.norms[1][bidx, :, write_pos] = v_nrm[:, :, 0]
+        self.end_offset += T
 
     def asdict(self):
         d = {"codes": self.codes, "norms": self.norms,

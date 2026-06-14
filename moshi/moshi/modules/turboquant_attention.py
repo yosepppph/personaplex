@@ -63,11 +63,13 @@ def turboquant_attention_reference(q, cache, sm_scale=None):
 
     logits = torch.einsum('bhd,bhjd->bhj', qr, krot) * sm_scale
     # ring overwrites oldest slots in place; with end_offset >= C every slot
-    # holds a live (windowed) entry, otherwise only the first end_offset slots
-    n_valid = int(min(cache.end_offset.item(), C))
-    valid = torch.zeros(C, dtype=torch.bool, device=q.device)
-    valid[:n_valid] = True
-    logits = logits.masked_fill(~valid, float('-inf'))
+    # holds a live (windowed) entry, otherwise only the first end_offset slots.
+    # Per-slot: each batch element b has its own n_valid = min(end_offset[b], C)
+    # so slots can have independent timelines (continuous batching).
+    n_valid = torch.clamp(cache.end_offset, max=C)             # (B,)
+    ar = torch.arange(C, device=q.device)
+    valid = ar[None, :] < n_valid[:, None]                     # (B, C)
+    logits = logits.masked_fill(~valid[:, None, :], float('-inf'))
     attn = torch.softmax(logits, dim=-1)                       # (B,H,C)
     acc = torch.einsum('bhj,bhjd->bhd', attn, vrot)            # rotated domain
     return (acc @ rot).unsqueeze(2).to(q.dtype)                # inverse rotation
@@ -86,15 +88,19 @@ if HAS_TRITON:
         KN, VN,        # (B*H, C)  f16   per-vector norms
         CBK, CBV,      # (16,) f32 codebooks (tiny; stays L1/L2 resident)
         OUT,           # (B*H, D)  f32   rotated-domain accumulator output
-        END_OFFSET,    # i64 ptr [1]: cache.end_offset; n_valid = min(., C).
-                       # Read on-device (not via .item()) so the launch is
-                       # legal inside a CUDA graph and tracks the in-place
-                       # end_offset.add_() done by write_only each step.
+        END_OFFSET,    # i64 ptr [B]: per-slot cache.end_offset; for program
+                       # (b, h) -> n_valid = min(end_offset[b], C). Read
+                       # on-device (not via .item()) so the launch is legal
+                       # inside a CUDA graph and tracks the in-place
+                       # end_offset += T done by write_only each step. Per-slot
+                       # (indexed by b) so batch slots can have INDEPENDENT
+                       # timelines (continuous batching / async join).
         C: tl.constexpr, D: tl.constexpr, HALF_D: tl.constexpr,
-        BLOCK_C: tl.constexpr, SM_SCALE: tl.constexpr,
+        NH: tl.constexpr, BLOCK_C: tl.constexpr, SM_SCALE: tl.constexpr,
     ):
         pid = tl.program_id(0)                       # one program per (b, h)
-        n_valid = tl.minimum(tl.load(END_OFFSET), C).to(tl.int32)
+        b = pid // NH                                # slot index
+        n_valid = tl.minimum(tl.load(END_OFFSET + b), C).to(tl.int32)
         dh = tl.arange(0, HALF_D)
         qe = tl.load(QR + pid * D + 2 * dh)          # q at even coords
         qo = tl.load(QR + pid * D + 2 * dh + 1)      # q at odd coords
@@ -156,7 +162,7 @@ def turboquant_attention_triton(q, cache, sm_scale=None, block_c: int = 128):
         cache.norms[0].reshape(B * H, C),
         cache.norms[1].reshape(B * H, C),
         cache.cb_k, cache.cb_v, out, cache.end_offset,
-        C=C, D=D, HALF_D=D // 2, BLOCK_C=block_c, SM_SCALE=sm_scale,
+        C=C, D=D, HALF_D=D // 2, NH=H, BLOCK_C=block_c, SM_SCALE=sm_scale,
     )
     # single inverse rotation per (b, h)
     return (out @ cache.rot).reshape(B, H, 1, D).to(q.dtype)
