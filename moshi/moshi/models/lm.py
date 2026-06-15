@@ -759,7 +759,13 @@ class LMGen(StreamingModule[_LMGenState]):
                            input_tokens: torch.Tensor=None,
                            moshi_tokens:torch.Tensor=None,
                            text_token:torch.Tensor=None,
+                           force_mask: Optional[torch.Tensor]=None,
                            ):
+        # `force_mask` ([B] bool) enables mixed batches for continuous batching:
+        # where True, the given moshi/text tokens are teacher-forced for that slot
+        # (priming); where False, the slot free-runs (the model's generated tokens
+        # are kept). `force_mask=None` keeps the original behaviour (force all rows),
+        # used by the single-user / training paths.
         state = self._streaming_state
         if state is None:
             raise RuntimeError(
@@ -801,13 +807,25 @@ class LMGen(StreamingModule[_LMGenState]):
                 k = 1 + q_moshi
                 delay = lm_model.delays[k]
                 write_position = (state.offset + delay) % CT
-                state.cache[:, k, write_position : write_position + 1] = moshi_tokens[:, q_moshi]
-                state.provided[:, k, write_position : write_position + 1] = True
+                if force_mask is None:
+                    state.cache[:, k, write_position : write_position + 1] = moshi_tokens[:, q_moshi]
+                    state.provided[:, k, write_position : write_position + 1] = True
+                else:
+                    # Only overwrite + mark provided for the forced (priming) slots;
+                    # live slots keep their generated agent tokens (provided stays False).
+                    state.cache[:, k, write_position] = torch.where(
+                        force_mask, moshi_tokens[:, q_moshi, 0], state.cache[:, k, write_position])
+                    state.provided[:, k, write_position] = force_mask
 
         if text_token is not None:
             write_position = (state.offset + lm_model.delays[0]) % CT
-            state.cache[:, 0, write_position] = text_token
-            state.provided[:, 0, write_position] = True
+            if force_mask is None:
+                state.cache[:, 0, write_position] = text_token
+                state.provided[:, 0, write_position] = True
+            else:
+                state.cache[:, 0, write_position] = torch.where(
+                    force_mask, text_token, state.cache[:, 0, write_position])
+                state.provided[:, 0, write_position] = force_mask
 
         for k, delay in enumerate(lm_model.delays):
             # Only for the very beginning, we extend the initial token for the acoustic
@@ -844,12 +862,12 @@ class LMGen(StreamingModule[_LMGenState]):
 
     @torch.no_grad()
     def step(self, input_tokens: torch.Tensor=None, moshi_tokens:torch.Tensor=None, text_token:torch.Tensor=None,
-             return_embeddings: bool=False) \
+             return_embeddings: bool=False, force_mask: Optional[torch.Tensor]=None) \
         -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state = self._streaming_state
         lm_model = self.lm_model
         prepared_inputs = self.prepare_step_input(
-            input_tokens, moshi_tokens, text_token,
+            input_tokens, moshi_tokens, text_token, force_mask=force_mask,
         )
         # print("INPUT:", None if input_tokens is None else input_tokens.squeeze().cpu().tolist()) # DEBUG
         # print("MOSHI:", None if moshi_tokens is None else moshi_tokens.squeeze().cpu().tolist()) # DEBUG

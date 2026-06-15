@@ -59,6 +59,14 @@ def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
     return torch.device("cpu")
 
 
+def wrap_with_system_tags(text: str) -> str:
+    """Add <system> ... <system> tags as the model expects if missing."""
+    cleaned = text.strip()
+    if cleaned.startswith("<system>") and cleaned.endswith("<system>"):
+        return cleaned
+    return f"<system> {cleaned} <system>"
+
+
 def seed_all(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -86,16 +94,21 @@ class EngineServer:
         clog = ColorizedLog.randomize()
         clog.log("info", f"incoming connection from {request.remote}")
 
-        idx = self.engine.acquire()
+        # Phase 3a: inject the recipe/system text prompt per slot on join. (Per-slot
+        # voice prompt is Phase 3b -- the query param is accepted but not yet applied.)
+        text_prompt = request.query.get("text_prompt", "")
+        text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
+            if text_prompt else None)
+
+        idx = self.engine.acquire(text_prompt_tokens=text_prompt_tokens)
         if idx is None:
             clog.log("warning", "engine full -> rejecting connection")
             await ws.close(code=aiohttp.WSCloseCode.TRY_AGAIN_LATER,
                            message=b"server full")
             return ws
-        clog.log("info", f"assigned slot {idx} (active={self.engine.active_count()})")
-
-        # NOTE: voice_prompt / text_prompt query params are accepted by the client
-        # contract but NOT injected per-slot yet (Phase 3). Default voice, no recipe.
+        clog.log("info", f"assigned slot {idx} (active={self.engine.active_count()}, "
+                          f"prompt_tokens={len(text_prompt_tokens) if text_prompt_tokens else 0})")
 
         opus_reader = sphn.OpusStreamReader(self.sample_rate)
         opus_writer = sphn.OpusStreamWriter(self.sample_rate)
