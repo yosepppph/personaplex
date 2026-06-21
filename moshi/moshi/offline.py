@@ -392,13 +392,13 @@ def main():
 
     # Runtime / sampling controls (mirror UI semantics)
     parser.add_argument(
-        "--temp-audio", type=float, default=0.8, help="Audio sampling temperature (default: 0.8)"
+        "--temp-audio", type=float, default=0.65, help="Audio sampling temperature (default: 0.65; lower reduces accent drift)"
     )
     parser.add_argument(
         "--temp-text", type=float, default=0.7, help="Text sampling temperature (default: 0.7)"
     )
     parser.add_argument(
-        "--topk-audio", type=int, default=250, help="Audio top-k sampling (default: 250)"
+        "--topk-audio", type=int, default=80, help="Audio top-k sampling (default: 80; lower reduces accent drift)"
     )
     parser.add_argument(
         "--topk-text", type=int, default=25, help="Text top-k sampling (default: 25)"
@@ -412,7 +412,7 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
-    parser.add_argument("--seed", type=int, default=-1, help="Seed for reproducibility (-1 disables)")
+    parser.add_argument("--seed", type=int, default=42424242, help="Seed for reproducibility (-1 disables)")
     parser.add_argument("--profile", action="store_true",
                         help="Measure per-frame latency, peak GPU memory, and RTF (P0 baseline).")
     parser.add_argument("--profile-warmup-frames", type=int, default=8,

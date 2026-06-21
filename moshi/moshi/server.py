@@ -109,6 +109,10 @@ class ServerState:
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+                            # Accent-consistency tuning: tighter audio sampling reduces
+                            # accent drift within an utterance (was temp=0.8, top_k=250).
+                            temp=0.65,
+                            top_k=80,
         )
         
         self.lock = asyncio.Lock()
@@ -168,7 +172,9 @@ class ServerState:
             else:
                 self.lm_gen.load_voice_prompt(voice_prompt_path)
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
-        seed = int(request["seed"]) if "seed" in request.query else None
+        # Accent-consistency tuning: pin a default seed so each session is
+        # deterministic instead of random (client can still override via ?seed=).
+        seed = int(request["seed"]) if "seed" in request.query else 42424242
 
         async def recv_loop():
             nonlocal close
