@@ -24,8 +24,10 @@ they never race with the in-flight GPU step.
 
 This module is transport-agnostic: connections push PCM frames with submit_pcm()
 and read results from a slot's output queue. Phase 4 wires WebSockets to it.
-Phase 3a injects a per-slot recipe/text system prompt on join (acquire takes
-text_prompt_tokens); per-slot voice prompts are Phase 3b.
+Phase 3a injects a per-slot recipe/text system prompt on join; Phase 3b teacher-forces
+a per-slot voice prompt (acquire takes text_prompt_tokens and voice_codes). The voice
+prompt must be Mimi codes from a .wav clip (see encode_voice_wav) -- the packaged .pt
+voice embeddings use a different (whole-batch) code path that can't be applied per slot.
 """
 
 import asyncio
@@ -40,6 +42,12 @@ import numpy as np
 import torch
 
 from .models import LMGen, MimiModel
+from .models.lm import (
+    load_audio,
+    normalize_audio,
+    _iterate_audio,
+    encode_from_sphn,
+)
 from .utils.profiling import profile_section
 
 
@@ -59,6 +67,10 @@ class Slot:
     # Per-slot priming script: a list of text-token ids force-fed one per tick while
     # PRIMING (silence frames use zero_text_code; recipe tokens carry the prompt).
     prime_script: List[int] = field(default_factory=list)
+    # Phase 3b: the matching per-frame agent (moshi) audio codes [L, 8] force-fed
+    # alongside prime_script. Voice-prompt codes for the first Tv frames, silence
+    # after. None until acquire() builds it.
+    prime_agent: Optional["torch.Tensor"] = None
     prime_cursor: int = 0
     in_q: "asyncio.Queue[np.ndarray]" = field(default_factory=lambda: asyncio.Queue(maxsize=64))
     out_q: "asyncio.Queue[Tuple[np.ndarray, Optional[int]]]" = field(
@@ -84,8 +96,10 @@ class BatchedEngine:
         self.frame_size = int(sample_rate / frame_rate)
         self.frame_period = 1.0 / frame_rate
 
+        # Match the single-user server's accent-consistency tuning: tighter audio
+        # sampling reduces accent drift (was the LMGen default temp=0.8 / top_k=250).
         self.lm_gen = LMGen(lm, sample_rate=sample_rate, device=self.device,
-                            frame_rate=frame_rate)
+                            frame_rate=frame_rate, temp=0.65, top_k=80)
         self.mimi.streaming_forever(max_slots)
         self.lm_gen.streaming_forever(max_slots)
 
@@ -108,6 +122,12 @@ class BatchedEngine:
         self.silence_frames = max(1, int(0.5 * frame_rate))
         self._sine_codes = self.lm_gen._encode_sine_frame()    # [1, 8, 1] long
         self._zero_codes = self.lm_gen._encode_zero_frame()    # [1, 8, 1] long
+        # Single silence frame as a [1, 8] row, used to default the per-slot agent
+        # (moshi) priming stream to silence before overwriting the voice-prompt span.
+        self._silence_row = self._zero_codes.reshape(1, 8)
+        # Cap voice-prompt length so a long clip can't make a join wait forever
+        # (the slot is silent/PRIMING for the whole voice span). 10 s at frame rate.
+        self.max_voice_frames = int(10 * frame_rate)
 
         self.slots = [Slot(i) for i in range(max_slots)]
         self._silence = torch.zeros(max_slots, 1, self.frame_size,
@@ -131,17 +151,21 @@ class BatchedEngine:
 
     # ---------------- slot lifecycle (event loop only) ----------------
 
-    def acquire(self, text_prompt_tokens: Optional[List[int]] = None) -> Optional[int]:
+    def acquire(self, text_prompt_tokens: Optional[List[int]] = None,
+                voice_codes: Optional[torch.Tensor] = None) -> Optional[int]:
         """Reserve a FREE slot for a new connection, or None if the engine is full.
 
         `text_prompt_tokens` is the tokenized recipe/system prompt to inject on join.
+        `voice_codes` ([8, Tv] Mimi audio codes) is the per-slot voice prompt (Phase
+        3b); None falls back to the default voice (Phase 3a behaviour).
         The slot is marked PENDING; the actual model reset + priming start happens on
         the engine loop (between GPU steps) so it never races with an in-flight step.
         """
         for slot in self.slots:
             if slot.state == SlotState.FREE:
                 slot.state = SlotState.PENDING
-                slot.prime_script = self._build_prime_script(text_prompt_tokens)
+                slot.prime_script, slot.prime_agent = self._build_prime_script(
+                    text_prompt_tokens, voice_codes)
                 slot.prime_cursor = 0
                 for q in (slot.in_q, slot.out_q):
                     while not q.empty():
@@ -152,11 +176,57 @@ class BatchedEngine:
                 return slot.idx
         return None
 
-    def _build_prime_script(self, text_prompt_tokens: Optional[List[int]]) -> List[int]:
-        """silence -> recipe text -> silence, as a sequence of forced text tokens."""
+    def _build_prime_script(self, text_prompt_tokens: Optional[List[int]],
+                            voice_codes: Optional[torch.Tensor] = None):
+        """Build the per-frame priming script: voice -> silence -> recipe text -> silence,
+        mirroring the single-user `step_system_prompts`.
+
+        Returns (text_script, agent_script):
+          - text_script: list[int], one forced text token per frame (zero_text_code
+            except during the recipe-text span).
+          - agent_script: LongTensor [L, 8], the forced agent (moshi) audio codes per
+            frame -- the voice-prompt codes for the first Tv frames, silence after.
+        Both have the same length L so prime_cursor indexes both.
+        """
+        Tv = 0 if voice_codes is None else int(voice_codes.shape[-1])
+        voice_text = [self.zero_text_code] * Tv
         silence = [self.zero_text_code] * self.silence_frames
         text = list(text_prompt_tokens) if text_prompt_tokens else []
-        return silence + text + silence
+        text_script = voice_text + silence + text + silence
+        L = len(text_script)
+        # Default every frame's agent stream to silence, then overwrite the voice span.
+        agent_script = self._silence_row.repeat(L, 1).clone()      # [L, 8]
+        if Tv > 0:
+            # voice_codes is [8, Tv] -> [Tv, 8] to align with per-frame rows.
+            agent_script[:Tv] = voice_codes.transpose(0, 1).to(agent_script.dtype)
+        return text_script, agent_script
+
+    @torch.no_grad()
+    def encode_voice_wav(self, voice_mimi: MimiModel, wav_path: str) -> Optional[torch.Tensor]:
+        """Encode a voice-prompt WAV into Mimi audio codes [8, Tv] for teacher-forcing
+        during a slot's priming.
+
+        Uses a DEDICATED `voice_mimi` (not the shared streaming engine mimi) so it can
+        run on the event loop without corrupting the batch's streaming state. Mirrors
+        the single-user `load_voice_prompt` (-24 LUFS mono) + `_encode_voice_prompt_frames`.
+        """
+        audio = load_audio(wav_path, self.sample_rate)              # (C, T)
+        audio = normalize_audio(audio, self.sample_rate, -24.0)     # mono, -24 LUFS
+        if audio.ndim == 1:
+            audio = audio[None, :]
+        voice_mimi.reset_streaming()
+        frames = [chunk.reshape(1, 8, -1) for chunk in encode_from_sphn(
+            voice_mimi,
+            _iterate_audio(audio, sample_interval_size=self.frame_size, pad=True),
+            max_batch=1,
+        )]
+        voice_mimi.reset_streaming()
+        if not frames:
+            return None
+        codes = torch.cat(frames, dim=-1)[0]                       # [8, Tv]
+        if codes.shape[-1] > self.max_voice_frames:
+            codes = codes[:, :self.max_voice_frames]
+        return codes.to(self.device)
 
     def release(self, idx: int):
         self.slots[idx].state = SlotState.FREE
@@ -197,14 +267,18 @@ class BatchedEngine:
 
     # ---------------- tick split: gather (loop) / compute (thread) / scatter (loop) ----------------
 
-    def _gather_inputs(self) -> Tuple[torch.Tensor, List[int], List[int], torch.Tensor, torch.Tensor]:
+    def _gather_inputs(self) -> Tuple[torch.Tensor, List[int], List[int], torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = self._silence.clone()
         active: List[int] = []
         priming: List[int] = []
-        # Per-slot teacher-forcing for this tick: priming slots force the agent
-        # stream silent + the scripted text token; live slots free-run (force=False).
+        # Per-slot teacher-forcing for this tick: priming slots force the scripted
+        # text token + the scripted agent audio codes (voice prompt during its span,
+        # silence otherwise); live slots free-run (force=False).
         force_cpu = [False] * self.max_slots
         text_cpu = [self.zero_text_code] * self.max_slots
+        # Default the agent (moshi) stream to silence for every slot; priming slots
+        # overwrite their row with the scripted codes (voice prompt or silence).
+        moshi = self._zero_codes.expand(self.max_slots, -1, -1).clone()  # [B, 8, 1]
         for slot in self.slots:
             if slot.state == SlotState.ACTIVE:
                 active.append(slot.idx)
@@ -217,25 +291,28 @@ class BatchedEngine:
             elif slot.state == SlotState.PRIMING:
                 priming.append(slot.idx)
                 force_cpu[slot.idx] = True
-                text_cpu[slot.idx] = slot.prime_script[slot.prime_cursor]
+                c = slot.prime_cursor
+                text_cpu[slot.idx] = slot.prime_script[c]
+                moshi[slot.idx, :, 0] = slot.prime_agent[c]
         force = torch.tensor(force_cpu, dtype=torch.bool, device=self.device)
         text = torch.tensor(text_cpu, dtype=torch.long, device=self.device)
-        return batch, active, priming, force, text
+        return batch, active, priming, force, text, moshi
 
     @torch.no_grad()
-    def _compute(self, batch: torch.Tensor, force: torch.Tensor, text: torch.Tensor):
+    def _compute(self, batch: torch.Tensor, force: torch.Tensor, text: torch.Tensor,
+                 moshi: torch.Tensor):
         """GPU step. Runs in the worker thread. Touches no asyncio.Queue.
 
-        `force` ([B] bool) / `text` ([B] long) drive per-slot priming: where force is
-        True the user stream is overridden with the sine frame, the agent stream is
-        forced silent, and the text token is teacher-forced. Where False the slot
-        free-runs (force write is a no-op), so passing these every tick is safe even
-        when nothing is priming."""
+        `force` ([B] bool) / `text` ([B] long) / `moshi` ([B, 8, 1] long) drive per-slot
+        priming: where force is True the user stream is overridden with the sine frame,
+        the agent stream is teacher-forced to `moshi` (the voice-prompt codes during the
+        voice span, silence otherwise), and the text token is teacher-forced. Where False
+        the slot free-runs (force write is a no-op), so passing these every tick is safe
+        even when nothing is priming."""
         with profile_section("frame"):
             codes = self.mimi.encode(batch)                         # [B, 8, T]
             # Priming slots: user stream = sine frame (not the encoded silence).
             codes = torch.where(force.view(-1, 1, 1), self._sine_codes, codes)
-            moshi = self._zero_codes.expand(codes.shape[0], -1, -1)  # [B, 8, 1] silent agent
             tokens = None
             for c in range(codes.shape[-1]):
                 tokens = self.lm_gen.step(
@@ -285,11 +362,11 @@ class BatchedEngine:
         while self._running:
             t0 = time.monotonic()
             self._process_joins()                 # event loop
-            batch, active, priming, force, text = self._gather_inputs()  # event loop
+            batch, active, priming, force, text, moshi = self._gather_inputs()  # event loop
             if active or priming:
                 # GPU work off the event loop; loop services clients meanwhile.
                 result = await loop.run_in_executor(
-                    self._executor, self._compute, batch, force, text)
+                    self._executor, self._compute, batch, force, text, moshi)
                 self._scatter(active, result)      # event loop
                 self._advance_priming()            # event loop: advance after the step
                 dt = time.monotonic() - t0

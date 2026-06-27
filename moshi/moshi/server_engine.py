@@ -16,13 +16,18 @@ Per connection:
   - out_loop  : slot.out_q (pcm, text_token) -> opus_writer + text -> WS,
   - release() the slot on disconnect.
 
-CAVEAT (Phase 3 not done yet): the engine does not inject a per-slot voice or recipe
-prompt on join, so every connection currently gets the default voice and NO recipe.
-This server proves the multi-client plumbing; recipe-awareness lands in Phase 3.
+Per-slot conditioning on join:
+  - Phase 3a: the recipe/system text prompt (?text_prompt=) is injected per slot.
+  - Phase 3b: the voice prompt (?voice_prompt=) is teacher-forced per slot when
+    --voice-prompt-dir points at a directory of .wav voice clips. Without that flag
+    (or for voices that only exist as .pt), every connection gets the default voice.
+    The .pt embeddings cannot be teacher-forced per slot while other slots stream,
+    so the batched engine needs .wav voice clips.
 
 Run (TurboQuant env flags are REQUIRED by the engine):
   PERSONAPLEX_TURBOQUANT_KV=1 PERSONAPLEX_TURBOQUANT_FUSED=1 \
-      python -m moshi.server_engine --port 8998 --device cuda --max-slots 16
+      python -m moshi.server_engine --port 8998 --device cuda --max-slots 16 \
+      --voice-prompt-dir /path/to/wav_voices
 """
 
 import argparse
@@ -82,11 +87,50 @@ class EngineServer:
     """Transport layer: maps each WebSocket connection onto one engine slot."""
 
     def __init__(self, engine: BatchedEngine,
-                 text_tokenizer: sentencepiece.SentencePieceProcessor):
+                 text_tokenizer: sentencepiece.SentencePieceProcessor,
+                 voice_mimi=None,
+                 voice_prompt_dir: Optional[str] = None):
         self.engine = engine
         self.text_tokenizer = text_tokenizer
         self.sample_rate = engine.sample_rate
         self.frame_size = engine.frame_size
+        # Phase 3b: per-slot voice prompt. `voice_mimi` is a DEDICATED Mimi used only
+        # to encode voice WAVs to codes (separate from the engine's streaming mimi).
+        # `voice_prompt_dir` holds the .wav voice clips. Codes are cached per voice.
+        self.voice_mimi = voice_mimi
+        self.voice_prompt_dir = voice_prompt_dir
+        self._voice_codes_cache: dict = {}
+
+    def _get_voice_codes(self, voice_name: str):
+        """Resolve a voice name to Mimi codes [8, Tv], encoding its .wav once and
+        caching the result. Returns None (default voice) when voice support is off,
+        the name is empty, or only a .pt (non-WAV) file exists -- the batched engine
+        teacher-forces audio codes, which can only come from a WAV."""
+        if not voice_name or self.voice_mimi is None or self.voice_prompt_dir is None:
+            return None
+        if voice_name in self._voice_codes_cache:
+            return self._voice_codes_cache[voice_name]
+        base = os.path.join(self.voice_prompt_dir, voice_name)
+        wav_path = None
+        for cand in (base, base + ".wav", os.path.splitext(base)[0] + ".wav"):
+            if cand.endswith(".wav") and os.path.exists(cand):
+                wav_path = cand
+                break
+        if wav_path is None:
+            logger.warning(
+                f"voice '{voice_name}': no .wav found in {self.voice_prompt_dir}; "
+                f"using the default voice. The batched engine needs a .wav voice clip "
+                f"(the packaged .pt embeddings cannot be teacher-forced per slot).")
+            self._voice_codes_cache[voice_name] = None
+            return None
+        try:
+            codes = self.engine.encode_voice_wav(self.voice_mimi, wav_path)
+        except Exception as e:
+            logger.warning(f"voice '{voice_name}': failed to encode {wav_path} ({e}); "
+                           f"using the default voice.")
+            codes = None
+        self._voice_codes_cache[voice_name] = codes
+        return codes
 
     async def handle_chat(self, request):
         ws = web.WebSocketResponse()
@@ -94,21 +138,29 @@ class EngineServer:
         clog = ColorizedLog.randomize()
         clog.log("info", f"incoming connection from {request.remote}")
 
-        # Phase 3a: inject the recipe/system text prompt per slot on join. (Per-slot
-        # voice prompt is Phase 3b -- the query param is accepted but not yet applied.)
+        # Phase 3a: inject the recipe/system text prompt per slot on join.
         text_prompt = request.query.get("text_prompt", "")
         text_prompt_tokens = (
             self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
             if text_prompt else None)
 
-        idx = self.engine.acquire(text_prompt_tokens=text_prompt_tokens)
+        # Phase 3b: per-slot voice prompt. Resolve the voice name to Mimi codes (None
+        # -> default voice). Encoding is cached, so only the first connection per voice
+        # pays the cost (a brief one-time hiccup on the event loop).
+        voice_name = request.query.get("voice_prompt", "")
+        voice_codes = self._get_voice_codes(voice_name)
+
+        idx = self.engine.acquire(text_prompt_tokens=text_prompt_tokens,
+                                  voice_codes=voice_codes)
         if idx is None:
             clog.log("warning", "engine full -> rejecting connection")
             await ws.close(code=aiohttp.WSCloseCode.TRY_AGAIN_LATER,
                            message=b"server full")
             return ws
         clog.log("info", f"assigned slot {idx} (active={self.engine.active_count()}, "
-                          f"prompt_tokens={len(text_prompt_tokens) if text_prompt_tokens else 0})")
+                          f"prompt_tokens={len(text_prompt_tokens) if text_prompt_tokens else 0}, "
+                          f"voice={voice_name or 'default'}"
+                          f"{'' if voice_codes is not None else ' (default)'})")
 
         opus_reader = sphn.OpusStreamReader(self.sample_rate)
         opus_writer = sphn.OpusStreamWriter(self.sample_rate)
@@ -221,6 +273,12 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--ssl", type=str,
                         help="Directory with key.pem and cert.pem to serve https.")
+    parser.add_argument("--voice-prompt-dir", type=str,
+                        help="Directory of .wav voice clips for per-slot voice prompts "
+                             "(Phase 3b). The client's ?voice_prompt= names a file here. "
+                             "Omit to disable voice prompts (default voice for everyone). "
+                             "NOTE: must be .wav clips -- the packaged .pt embeddings are "
+                             "not usable by the batched engine.")
     args = parser.parse_args()
 
     if os.environ.get("PERSONAPLEX_TURBOQUANT_KV") != "1" or \
@@ -262,7 +320,20 @@ def main():
     logger.info(f"warming up the engine (max_slots={args.max_slots})")
     engine.warmup()
 
-    server = EngineServer(engine, text_tokenizer)
+    # Phase 3b: a dedicated Mimi (batch 1) used only to encode voice-prompt WAVs into
+    # codes -- kept separate from the engine's max_slots streaming mimi so encoding a
+    # voice never disturbs the live batch. Only created when voice prompts are enabled.
+    voice_mimi = None
+    if args.voice_prompt_dir is not None:
+        if not os.path.isdir(args.voice_prompt_dir):
+            raise SystemExit(f"--voice-prompt-dir does not exist: {args.voice_prompt_dir}")
+        logger.info(f"voice prompts enabled from {args.voice_prompt_dir}")
+        voice_mimi = loaders.get_mimi(args.mimi_weight, args.device)
+        voice_mimi.streaming_forever(1)
+
+    server = EngineServer(engine, text_tokenizer,
+                          voice_mimi=voice_mimi,
+                          voice_prompt_dir=args.voice_prompt_dir)
 
     app = web.Application()
 
