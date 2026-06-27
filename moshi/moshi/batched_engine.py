@@ -211,7 +211,19 @@ class BatchedEngine:
         the single-user `load_voice_prompt` (-24 LUFS mono) + `_encode_voice_prompt_frames`.
         """
         audio = load_audio(wav_path, self.sample_rate)              # (C, T)
-        audio = normalize_audio(audio, self.sample_rate, -24.0)     # mono, -24 LUFS
+        # Downmix to mono: both the encoder and the loudness normalizer expect a
+        # single channel (a stereo clip otherwise breaks normalization).
+        if audio.ndim == 2 and audio.shape[0] > 1:
+            audio = audio.mean(axis=0, keepdims=True)              # (1, T)
+        # Normalize to -24 LUFS for a consistent voice level. pyloudnorm is an
+        # optional dep; if it's missing, fall back to simple peak normalization so a
+        # voice prompt still works rather than silently disabling itself.
+        try:
+            audio = normalize_audio(audio, self.sample_rate, -24.0)
+        except Exception:
+            a = audio[0] if (audio.ndim == 2 and audio.shape[0] == 1) else audio
+            peak = float(np.abs(a).max()) or 1.0
+            audio = a * (0.95 / peak)
         if audio.ndim == 1:
             audio = audio[None, :]
         voice_mimi.reset_streaming()
