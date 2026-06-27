@@ -183,3 +183,7 @@ mlx-trace.json
 # Include everything in assets
 !assets/
 !assets/**
+
+# Include committed voice-prompt wavs (overrides *.wav above)
+!voices/
+!voices/**
