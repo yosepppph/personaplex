@@ -42,7 +42,7 @@ from torch.nn import functional as F
 
 from ..utils.compile import no_compile
 from .gating import make_gating
-from .rope import RotaryEmbedding
+from .rope import RotaryEmbedding, rope_realign
 from .streaming import StreamingModule, StreamingContainer
 
 # TurboQuant Phase 2 fused decode attention. Safe to import at module load:
@@ -409,6 +409,11 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         self.context = context
         self.rope = rope
         self.num_heads = num_heads
+        # Fix A: re-place a pinned prompt prefix just before the rolling window
+        # so its distance to the query stays within `context`. Read once here
+        # (process-level constant) so the remap branch is decided BEFORE any
+        # CUDA-graph capture; the per-step shift amount is driven by live tensors.
+        self.pin_prompt_prefix = os.environ.get("PERSONAPLEX_PIN_PROMPT", "0") == "1"
 
         out_dim = embed_dim
         out_dim = 3 * embed_dim
@@ -522,23 +527,37 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
             k, v, pos_k = self._complete_kv(k, v)
             if self.causal:
                 pos_k = pos_k.view(1, -1)
+                # Fix A: re-place the pinned prompt prefix just before the rolling
+                # window so its distance to the query stays within `context` and
+                # never extrapolates RoPE (which otherwise destabilises long calls).
+                # Gated by a process-level flag (constant before graph capture);
+                # the shift amount is driven by live tensors so graph replay is safe.
+                # While pinned == 0 (not yet pinned, or feature off) the shift is 0
+                # everywhere -> exact identity, behaviour unchanged.
+                if (self.pin_prompt_prefix and self.context is not None
+                        and self.rope is not None and state is not None):
+                    pinned = getattr(state.kv_cache, "pinned", None)
+                    if pinned is not None:
+                        C = pos_k.shape[-1]
+                        idx_all = torch.arange(C, device=q.device).view(1, -1)
+                        is_pref = idx_all < pinned                       # [1, C]
+                        # Move the oldest prefix slot to position
+                        # (offset - context + 1); 0 while offset < context (the
+                        # prompt is still naturally inside one context window).
+                        d = torch.clamp(offset - self.context + 1, min=0)
+                        slot_shift = torch.where(is_pref, d, torch.zeros_like(d))  # [1, C]
+                        k = rope_realign(k, slot_shift.view(-1), self.rope.max_period)
+                        pos_k = torch.where(pos_k >= 0, pos_k + slot_shift, pos_k)
                 pos_q = offset + torch.arange(T, device=q.device, dtype=torch.long).view(
                     -1, 1
                 )
                 delta = pos_q - pos_k
                 attn_bias = (pos_k >= 0) & (delta >= 0)
                 if self.context is not None:
-                    in_window = delta < self.context
-                    # Pinned prefix keys (pos_k < pinned) are exempt from the
-                    # sliding window so the system prompt stays attendable for
-                    # the whole conversation, however far past `context` it sits.
-                    # `pinned` is a tensor (0 when not pinned, so the term is a
-                    # no-op); the `is not None` guard is structural, decided at
-                    # graph-trace time, never on the tensor's value.
-                    pinned = getattr(state.kv_cache, "pinned", None) if state is not None else None
-                    if pinned is not None:
-                        in_window = in_window | ((pos_k >= 0) & (pos_k < pinned))
-                    attn_bias = attn_bias & in_window
+                    # After Fix A's remap the prefix sits within `context`, so the
+                    # standard sliding-window mask already includes it (no special
+                    # exemption needed).
+                    attn_bias = attn_bias & (delta < self.context)
             else:
                 attn_bias = None
             x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)

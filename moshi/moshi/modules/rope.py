@@ -89,6 +89,40 @@ def apply_rope(
     return qo.view(*dims, D), ko.view(*dims, D)
 
 
+@torch_compile_lazy
+def rope_realign(k: torch.Tensor, shift: torch.Tensor, max_period: float = 10_000):
+    """Apply an *additional* RoPE rotation of `shift[t]` positions to keys that
+    were already rotated at their original positions.
+
+    RoPE rotations compose additively in angle, so rotating a key baked at
+    position `p` by an extra `shift` yields a key that behaves as if it sat at
+    position `p + shift`. Used by the pinned-prefix "Fix A": re-place the prompt
+    keys just before the rolling window (a constant `shift` per prefix slot) so
+    their distance to the query stays within `context` and never extrapolates.
+    `shift == 0` is an exact identity (bf16 round-trips losslessly through f32),
+    so unshifted (conversation) slots are returned unchanged.
+
+    Args:
+        k (torch.Tensor): keys, shape `[B, H, T, D]` (post-RoPE, as stored).
+        shift (torch.Tensor): per-time-step extra position, shape `[T]`.
+        max_period (float): same max_period used by `apply_rope`.
+    """
+    B, H, T, D = k.shape
+    assert D % 2 == 0
+    ds = torch.arange(D // 2, device=k.device, dtype=torch.float32)
+    freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))      # [D//2]
+    ang = shift.float().view(T, 1) * freqs.view(1, -1)           # [T, D//2]
+    rotr = torch.cos(ang).view(1, 1, T, D // 2)
+    roti = torch.sin(ang).view(1, 1, T, D // 2)
+    kk = k.view(B, H, T, D // 2, 2)
+    kr = kk[..., 0].float()
+    ki = kk[..., 1].float()
+    # Same rotation convention as apply_rope, so this composes with it exactly.
+    kor = kr * rotr - ki * roti
+    koi = kr * roti + ki * rotr
+    return torch.stack([kor.to(k.dtype), koi.to(k.dtype)], dim=-1).view(B, H, T, D)
+
+
 class RotaryEmbedding(nn.Module):
     """Rotary positional embedding (RoPE) from [Su et al 2022](https://arxiv.org/abs/2104.09864).
 
