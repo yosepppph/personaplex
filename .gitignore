@@ -187,3 +187,5 @@ mlx-trace.json
 # Include committed voice-prompt wavs (overrides *.wav above)
 !voices/
 !voices/**
+
+.DS_Store
