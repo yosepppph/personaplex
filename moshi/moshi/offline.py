@@ -264,6 +264,8 @@ def run_inference(
     other_mimi.reset_streaming()
     lm_gen.reset_streaming()
     lm_gen.step_system_prompts(mimi)
+    # Pin the prompt as a permanent prefix (no-op unless PERSONAPLEX_PIN_PROMPT=1).
+    lm_gen.pin_system_prompt()
     # Reset mimi streaming after voice prompt encoding
     mimi.reset_streaming()
 

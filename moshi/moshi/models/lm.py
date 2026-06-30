@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from os.path import splitext
+import os
 import logging
 import numpy as np
 import sys
@@ -753,7 +754,31 @@ class LMGen(StreamingModule[_LMGenState]):
             kv = getattr(mstate, "kv_cache", None) if mstate is not None else None
             if kv is not None and hasattr(kv, "reset_slot"):
                 kv.reset_slot(b)
-    
+
+    @torch.no_grad()
+    def pin_system_prompt(self) -> None:
+        """Pin the just-streamed system prompt as a permanent prefix.
+
+        Call ONCE, immediately after `step_system_prompts()`. Every temporal
+        transformer KV cache locks the frames written so far (voice + text
+        prompt) into slots [0, pinned): they are never overwritten by the ring
+        and stay attendable for the whole conversation, so the persona/voice
+        conditioning does not get evicted after ~`context` frames (~4 min).
+
+        Gated by PERSONAPLEX_PIN_PROMPT (default off => no-op, behaviour
+        bit-identical to upstream). Only caches with capacity > 256 are pinned,
+        i.e. the temporal transformer; the depformer's tiny within-frame cache
+        (capacity 8) is left alone.
+        """
+        if os.environ.get("PERSONAPLEX_PIN_PROMPT", "0") != "1":
+            return
+        for module in self.lm_model.modules():
+            mstate = getattr(module, "_streaming_state", None)
+            kv = getattr(mstate, "kv_cache", None) if mstate is not None else None
+            if (kv is not None and hasattr(kv, "pin_prefix")
+                    and getattr(kv, "capacity", 0) > 256):
+                kv.pin_prefix()
+
     @torch.no_grad()
     def prepare_step_input(self,
                            input_tokens: torch.Tensor=None,

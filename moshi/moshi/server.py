@@ -288,6 +288,9 @@ class ServerState:
             # Reuse mimi for encoding voice prompt and then reset it before conversation starts
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
+            # Pin the prompt as a permanent attention-sink prefix (no-op unless
+            # PERSONAPLEX_PIN_PROMPT=1) so it is never evicted by the ring cache.
+            self.lm_gen.pin_system_prompt()
             clog.log("info", "done with system prompts")
             # Send the handshake.
             if await is_alive():

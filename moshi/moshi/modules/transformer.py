@@ -279,15 +279,47 @@ class RingKVCache:
             dtype=dtype,
         )
         self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
+        # Number of leading frames pinned as a permanent prefix ("attention
+        # sink", StreamingLLM-style). 0 => plain ring, behaviour bit-identical to
+        # upstream. After pin_prefix(), slots [0, pinned) are never overwritten
+        # and conversation frames roll within the sub-ring [pinned, capacity).
+        # A TENSOR (not a python int) so its value flows through CUDA-graph
+        # replay: it is captured at graph trace time (when pinning is still 0,
+        # during prompt-stepping) but read live on every replay.
+        self.pinned = torch.zeros(1, device=device, dtype=torch.long)
 
     def reset(self):
         self.end_offset.zero_()
+        self.pinned.zero_()
+
+    def pin_prefix(self):
+        """Lock every frame written so far as a permanent prefix.
+
+        Call once, right after the system prompt has been streamed. From then
+        on `complete()` writes into the sub-ring [pinned, capacity) so the prompt
+        slots [0, pinned) are never overwritten, and `StreamingMultiheadAttention`
+        exempts them from the `delta < context` window so they stay attendable
+        for the whole conversation. (One-time host sync for the bounds check is
+        fine here — this runs at conversation start, not in the hot loop.)
+        """
+        p = int(self.end_offset.item())
+        assert 0 <= p < self.capacity, (
+            f"prefix ({p}) must be shorter than ring capacity ({self.capacity})"
+        )
+        self.pinned.fill_(p)
 
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape
-        indexes = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
-        indexes = indexes % self.capacity
+        # Write index. With pinned == 0 this is the plain ring `o % capacity`.
+        # With a pinned prefix, frames at offset o >= pinned roll within the
+        # sub-ring [pinned, capacity) (size W = capacity - pinned), so the prefix
+        # slots [0, pinned) are never overwritten. Frames written *before* the
+        # pin (o < pinned, i.e. the prompt itself) keep their natural slot o.
+        P = self.pinned
+        W = self.capacity - P
+        o = torch.arange(T, device=self.end_offset.device, dtype=self.end_offset.dtype) + self.end_offset
+        indexes = torch.where(o < P, o % self.capacity, P + ((o - P) % W))
         self.cache[0].index_copy_(2, indexes, k)
         self.cache[1].index_copy_(2, indexes, v)
         self.end_offset.add_(T)
@@ -295,28 +327,30 @@ class RingKVCache:
         keys = self.cache[0]
         values = self.cache[1]
 
-        indexes = torch.arange(
+        idx_all = torch.arange(
             self.capacity, device=self.end_offset.device, dtype=torch.long
         )
-        invalid = indexes >= self.end_offset
 
-        end_index = self.end_offset % self.capacity
-        delta = indexes - end_index
+        # Conversation sub-ring positions: identical to the upstream ring math
+        # but over [pinned, capacity). M = frames written into the sub-ring.
+        #   If last key is for step S, capacity C: it was written at S % C, then
+        #   end_offset = S + 1, end_index = (S + 1) % C. For index (S % C),
+        #   delta = -1 => position = S. The oldest slot (at end_offset) gets
+        #   position S + 1 - C. (Here all shifted by `pinned` for the sub-ring.)
+        j = idx_all - P
+        M = self.end_offset - P
+        end_index = M % W
+        delta = j - end_index
+        conv_pos = torch.where(delta <= 0, self.end_offset + delta,
+                               self.end_offset + delta - W)
+        conv_invalid = j >= M
 
-        # If last key is for step S, and capacity is C, last key was written at index S % C.
-        # then end_offset = S + 1, and end_index = (S + 1) % C.
-        # Then for index = (S % C), delta = -1, and the next code gives us:
-        # position(index) = (S + 1) - 1 = S, all good.
-        # Now the time step at end_offset is actually the oldest in the KVCache, e.g., its
-        # position should be (S - self.capacity + 1).
-        # The following code gives us:
-        # position(index + 1) = S + 1 + 0 - self.capacity.
-
-        positions = torch.where(
-            delta <= 0,
-            self.end_offset + delta,
-            self.end_offset + delta - self.capacity,
-        )
+        # Pinned prefix slots keep their true positions (0 .. pinned-1) and are
+        # always valid once written. (With pinned == 0 the prefix branch is empty
+        # and this reduces exactly to the upstream ring above.)
+        is_prefix = idx_all < P
+        positions = torch.where(is_prefix, idx_all, conv_pos)
+        invalid = torch.where(is_prefix, idx_all >= self.end_offset, conv_invalid)
         positions = torch.where(invalid, torch.full_like(positions, -1), positions)
 
         return KVCacheResult(keys, values, positions)
@@ -494,7 +528,17 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 delta = pos_q - pos_k
                 attn_bias = (pos_k >= 0) & (delta >= 0)
                 if self.context is not None:
-                    attn_bias = attn_bias & (delta < self.context)
+                    in_window = delta < self.context
+                    # Pinned prefix keys (pos_k < pinned) are exempt from the
+                    # sliding window so the system prompt stays attendable for
+                    # the whole conversation, however far past `context` it sits.
+                    # `pinned` is a tensor (0 when not pinned, so the term is a
+                    # no-op); the `is not None` guard is structural, decided at
+                    # graph-trace time, never on the tensor's value.
+                    pinned = getattr(state.kv_cache, "pinned", None) if state is not None else None
+                    if pinned is not None:
+                        in_window = in_window | ((pos_k >= 0) & (pos_k < pinned))
+                    attn_bias = attn_bias & in_window
             else:
                 attn_bias = None
             x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
