@@ -150,6 +150,119 @@ def run(batch_sizes, H, D, capacity, fill, device):
         del cache, q
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # ---- B2 pinned-prefix test (prompt pinning on the fused path) ----
+    # Each slot pins a DIFFERENT prefix length (incl. 0 = unpinned), the ring
+    # then wraps well past capacity. Checks, per slot:
+    #   1. write side: the pinned code/norm region is byte-identical after the
+    #      wrap (write_only never touches [0, pinned)); the sub-ring did change.
+    #   2. read side: reference == ground-truth dequant attention where ring
+    #      slots j < pinned[b] are scored with the prefix query q2 (kernel too,
+    #      when Triton is available).
+    #   3. identity: q_prefix=q must reproduce the no-prefix output exactly.
+    # Plus a RoPE sign-convention check: realigning the QUERY by -d must equal
+    # realigning the KEYS by +d (the equivalence B2 is built on).
+    if len(batch_sizes) and max(batch_sizes) >= 2:
+        Bp = max(b for b in batch_sizes if b >= 2)
+        pins = ([200, 0, 97, 400] * ((Bp + 3) // 4))[:Bp]
+        print(f"B2 pinned-prefix test (B={Bp}): pinned={pins}")
+        cache = TurboQuantRingKVCache(Bp, H, D, capacity, torch.device(device),
+                                      torch.bfloat16, bits=4, rotation="haar",
+                                      use_qjl_keys=False)
+        # Stage writes so slot b pins exactly after its pins[b]-th frame.
+        for i in range(max(pins)):
+            k = torch.randn(Bp, H, 1, D, device=device)
+            v = torch.randn(Bp, H, 1, D, device=device)
+            cache.write_only(k, v)
+            for b, p in enumerate(pins):
+                if p == i + 1:
+                    cache.pin_slot(b)
+        pre_codes = cache.codes.clone()
+        pre_norms = cache.norms.clone()
+        _fill_cache(cache, Bp, H, D, capacity + 500, device)   # wrap the sub-rings
+        ok_write = True
+        for b, p in enumerate(pins):
+            if p == 0:
+                continue
+            same_c = bool((cache.codes[:, b, :, :p].eq(pre_codes[:, b, :, :p])).all())
+            same_n = bool((cache.norms[:, b, :, :p].eq(pre_norms[:, b, :, :p])).all())
+            rolled = not bool((cache.codes[0, b, :, p:].eq(pre_codes[0, b, :, p:])).all())
+            ok_write = ok_write and same_c and same_n and rolled
+        print(f"  write side: prefix preserved + sub-ring rolled  "
+              f"{'[PASS]' if ok_write else '[FAIL]'}")
+
+        q = torch.randn(Bp, H, 1, D, device=device)
+        q2 = torch.randn(Bp, H, 1, D, device=device)   # stands in for rope_realign(q, -d)
+        pinned_t = cache.pinned                        # (B,)
+
+        # ground truth in the ORIGINAL domain: unrotate, per-key query select.
+        def _truth_prefix(q, q2, cache):
+            def unpack(codes, cb, n):
+                out = torch.empty(*codes.shape[:-1], codes.shape[-1] * 2,
+                                  device=codes.device, dtype=torch.float32)
+                out[..., 0::2] = cb[(codes & 0xF).long()]
+                out[..., 1::2] = cb[(codes >> 4).long()]
+                return out * n.unsqueeze(-1)
+            C = cache.capacity
+            kk = unpack(cache.codes[0], cache.cb_k, cache.norms[0].float()) @ cache.rot
+            vv = unpack(cache.codes[1], cache.cb_v, cache.norms[1].float()) @ cache.rot
+            sm = 1.0 / math.sqrt(q.shape[-1])
+            l1 = torch.einsum('bhd,bhjd->bhj', q.float().squeeze(2), kk) * sm
+            l2 = torch.einsum('bhd,bhjd->bhj', q2.float().squeeze(2), kk) * sm
+            ar = torch.arange(C, device=q.device)
+            logits = torch.where(ar[None, None, :] < cache.pinned[:, None, None], l2, l1)
+            n_valid = torch.clamp(cache.end_offset, max=C)
+            logits = logits.masked_fill(ar[None, None, :] >= n_valid[:, None, None],
+                                        float('-inf'))
+            attn = torch.softmax(logits, dim=-1)
+            return torch.einsum('bhj,bhjd->bhd', attn, vv).unsqueeze(2)
+
+        ref = tqa.turboquant_attention_reference(q, cache, q_prefix=q2)
+        truth = _truth_prefix(q, q2, cache)
+        rt = (ref.float() - truth.float()).abs().max().item()
+        line = f"  read side:  reference-vs-truth max|d|={rt:.2e}"
+        line += "  [PASS]" if rt < 2e-3 else "  [FAIL]"
+        # identity: same query for prefix and conversation == no prefix at all
+        rid = (tqa.turboquant_attention_reference(q, cache, q_prefix=q).float()
+               - tqa.turboquant_attention_reference(q, cache).float()).abs().max().item()
+        line += f"   identity(q_prefix=q) max|d|={rid:.2e}"
+        line += "  [PASS]" if rid == 0.0 else "  [FAIL]"
+        print(line)
+        if tqa.HAS_TRITON:
+            out = tqa.turboquant_attention_triton(q, cache, q_prefix=q2)
+            kr = (out.float() - ref.float()).abs().max().item()
+            # HAS_PREFIX variant with pinned=0 slots must match the plain kernel
+            out_plain = tqa.turboquant_attention_triton(q, cache)
+            b0 = [b for b, p in enumerate(pins) if p == 0]
+            kid = (out[b0].float() - out_plain[b0].float()).abs().max().item() \
+                if b0 else 0.0
+            line = (f"  kernel-vs-reference max|d|={kr:.2e}"
+                    + ("  [PASS]" if kr < 2e-3 else "  [FAIL]"))
+            # (compiled variants may schedule float ops differently; allow eps)
+            line += (f"   unpinned-slot identity max|d|={kid:.2e}"
+                     + ("  [PASS]" if kid < 1e-5 else "  [FAIL]"))
+            print(line)
+        del cache, q, q2
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # ---- RoPE equivalence: query realigned by -d  ==  keys realigned by +d
+        from .modules.rope import apply_rope, rope_realign
+        Bq, Hq, Tq = 2, 4, 1
+        qq = torch.randn(Bq, Hq, Tq, D, device=device)
+        kkk = torch.randn(Bq, Hq, 8, D, device=device)
+        S = torch.tensor([5000.0], device=device)          # query position
+        kpos = torch.tensor([0.0], device=device)          # prompt keys at 0..7
+        qr_, _ = apply_rope(qq, qq, S)
+        _, kr_ = apply_rope(kkk, kkk, kpos)
+        d = torch.tensor([3000.0, 1234.0], device=device)  # per-slot shifts
+        lhs = torch.einsum('bhtd,bhjd->bhtj',
+                           rope_realign(qr_, -d.view(Bq, 1)), kr_)
+        rhs = torch.einsum('bhtd,bhjd->bhtj', qr_,
+                           rope_realign(kr_, d.view(Bq, 1).expand(Bq, 8)))
+        req = (lhs - rhs).abs().max().item()
+        print(f"  rope q(-d) == k(+d) equivalence max|d|={req:.2e}  "
+              + ("[PASS]" if req < 1e-2 else "[FAIL]"))
     print("=" * 72)
     print("If all rows are [PASS], the kernel math is correct on this GPU and we "
           "can wire it into StreamingMultiheadAttention. If [FAIL], the Triton "

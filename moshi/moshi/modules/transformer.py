@@ -520,9 +520,25 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         )
         if use_fused:
             state.kv_cache.write_only(k, v)
+            # B2 pinning: keep the pinned prompt prefix attendable at in-window
+            # RoPE distances. Rather than re-rotating the (packed, quantized)
+            # prefix keys by +d as Fix A does on the SDPA path, exploit that
+            # RoPE logits are relative and hand the kernel a query realigned by
+            # -d for the prefix slots. Per-slot d_b = max(0, end_offset_b -
+            # context) (end_offset already includes this frame) places slot b's
+            # prefix at distances [context - P_b, context - 1], contiguous with
+            # its conversation sub-ring — the same in-distribution coverage as
+            # Fix A. All live tensors, fixed shapes: CUDA-graph safe. While
+            # pinned == 0 the prefix branch selects nothing (exact identity).
+            q_prefix = None
+            if (self.pin_prompt_prefix and self.context is not None
+                    and self.rope is not None
+                    and hasattr(state.kv_cache, "pinned")):
+                d = torch.clamp(state.kv_cache.end_offset - self.context, min=0)
+                q_prefix = rope_realign(q, -d.view(-1, 1), self.rope.max_period)
             _attn = (turboquant_attention_triton if _TQ_HAS_TRITON
                      else turboquant_attention_reference)
-            x = _attn(q, state.kv_cache)
+            x = _attn(q, state.kv_cache, q_prefix=q_prefix)
         else:
             k, v, pos_k = self._complete_kv(k, v)
             if self.causal:

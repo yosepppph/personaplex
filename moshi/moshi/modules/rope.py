@@ -104,16 +104,22 @@ def rope_realign(k: torch.Tensor, shift: torch.Tensor, max_period: float = 10_00
 
     Args:
         k (torch.Tensor): keys, shape `[B, H, T, D]` (post-RoPE, as stored).
-        shift (torch.Tensor): per-time-step extra position, shape `[T]`.
+        shift (torch.Tensor): per-time-step extra position, shape `[T]`, or
+            per-(batch, time-step), shape `[B, T]` (B2: each batched-engine slot
+            has its own timeline, so its own realign shift; may be negative --
+            shifting the QUERY by `-d` is equivalent to shifting keys by `+d`).
         max_period (float): same max_period used by `apply_rope`.
     """
     B, H, T, D = k.shape
     assert D % 2 == 0
     ds = torch.arange(D // 2, device=k.device, dtype=torch.float32)
     freqs = torch.exp(ds * (-math.log(max_period) * 2 / D))      # [D//2]
-    ang = shift.float().view(T, 1) * freqs.view(1, -1)           # [T, D//2]
-    rotr = torch.cos(ang).view(1, 1, T, D // 2)
-    roti = torch.sin(ang).view(1, 1, T, D // 2)
+    if shift.dim() == 2:  # per-slot: [B, T] -> angles [B, 1, T, D//2]
+        ang = shift.float().view(B, 1, T, 1) * freqs.view(1, 1, 1, -1)
+    else:                 # shared across batch: [T] -> angles [1, 1, T, D//2]
+        ang = shift.float().view(1, 1, T, 1) * freqs.view(1, 1, 1, -1)
+    rotr = torch.cos(ang)
+    roti = torch.sin(ang)
     kk = k.view(B, H, T, D // 2, 2)
     kr = kk[..., 0].float()
     ki = kk[..., 1].float()

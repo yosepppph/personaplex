@@ -780,6 +780,30 @@ class LMGen(StreamingModule[_LMGenState]):
                 kv.pin_prefix()
 
     @torch.no_grad()
+    def pin_slot(self, b: int) -> None:
+        """Pin slot b's just-primed prompt as its permanent prefix (B2).
+
+        Per-slot analogue of pin_system_prompt for the batched engine: call once
+        when slot b's priming script (voice + recipe text) has been fully
+        force-fed (PRIMING -> ACTIVE). Every temporal-transformer TurboQuant
+        cache locks the frames slot b wrote since its reset_slot; the fused
+        attention keeps them attendable via a realigned prefix query, so the
+        recipe/voice conditioning survives past ~context frames (~4 min).
+
+        Gated by PERSONAPLEX_PIN_PROMPT (default off => no-op). Only caches
+        with capacity > 256 (the temporal transformer) are pinned; requires the
+        fused TurboQuant path (the bf16 RingKVCache has no per-slot timelines).
+        """
+        if os.environ.get("PERSONAPLEX_PIN_PROMPT", "0") != "1":
+            return
+        for module in self.lm_model.modules():
+            mstate = getattr(module, "_streaming_state", None)
+            kv = getattr(mstate, "kv_cache", None) if mstate is not None else None
+            if (kv is not None and hasattr(kv, "pin_slot")
+                    and getattr(kv, "capacity", 0) > 256):
+                kv.pin_slot(b)
+
+    @torch.no_grad()
     def prepare_step_input(self,
                            input_tokens: torch.Tensor=None,
                            moshi_tokens:torch.Tensor=None,

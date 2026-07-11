@@ -173,6 +173,13 @@ class TurboQuantRingKVCache:
         # slots synchronized (the single-user server, the batch benchmark) every
         # entry is equal and behaviour is identical to a shared scalar offset.
         self.end_offset = torch.zeros(batch_size, device=device, dtype=torch.long)
+        # Per-slot pinned-prefix length (B,) — B2 pinning (see RingKVCache.pinned
+        # in transformer.py for the B1 analogue). After pin_slot(b), slot b's
+        # first pinned[b] frames (its voice + recipe prompt) are never overwritten:
+        # conversation frames roll within the sub-ring [pinned[b], capacity).
+        # 0 => plain per-slot ring, bit-identical to pre-B2 behaviour. A TENSOR so
+        # its live value flows through CUDA-graph replay (like end_offset).
+        self.pinned = torch.zeros(batch_size, device=device, dtype=torch.long)
 
     # ---------------- core transforms ----------------
 
@@ -215,6 +222,7 @@ class TurboQuantRingKVCache:
     def reset(self):
         """Reset every slot's timeline (whole batch)."""
         self.end_offset.zero_()
+        self.pinned.zero_()
 
     def reset_slot(self, b: int) -> None:
         """Reset a single slot's timeline to 0 (a new user takes slot b).
@@ -224,6 +232,36 @@ class TurboQuantRingKVCache:
         leftover codes are never attended to until b overwrites them.
         """
         self.end_offset[b] = 0
+        self.pinned[b] = 0
+
+    def pin_prefix(self) -> None:
+        """Pin every slot's frames written so far as its permanent prefix.
+
+        Whole-batch analogue of pin_slot, matching RingKVCache.pin_prefix so
+        LMGen.pin_system_prompt also works on the fused TurboQuant path (the
+        single-user server with PERSONAPLEX_TURBOQUANT_FUSED=1): call once,
+        right after the system prompt has been streamed. Requires the fused
+        read path — complete() asserts on pinned caches. (One-time host sync
+        for the bounds check is fine here — conversation start, not hot loop.)
+        """
+        p = int(self.end_offset.max().item())
+        assert 0 <= p < self.capacity, (
+            f"prefix ({p}) must be shorter than ring capacity ({self.capacity})"
+        )
+        self.pinned.copy_(self.end_offset)
+
+    def pin_slot(self, b: int) -> None:
+        """Lock every frame slot b has written so far as its permanent prefix.
+
+        Call once per slot, right after its priming script (voice + recipe text)
+        has been force-fed. From then on write_only() rolls slot b's conversation
+        frames within the sub-ring [pinned[b], capacity), so the prompt codes are
+        never overwritten, and the fused attention keeps them attendable via a
+        realigned prefix query (see turboquant_attention). Pure device-side
+        tensor write — no host sync, safe between CUDA-graph replays. The caller
+        is responsible for prompt length < capacity (the engine asserts its
+        prime script length at acquire time)."""
+        self.pinned[b] = self.end_offset[b]
 
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         # Phase-1 (dequant -> SDPA) fallback path. Per-slot ragged offsets are
@@ -234,6 +272,11 @@ class TurboQuantRingKVCache:
         assert bool((self.end_offset == self.end_offset[0]).all()), (
             "complete() requires a synchronized batch; use the fused path "
             "(PERSONAPLEX_TURBOQUANT_FUSED=1) for ragged per-slot offsets."
+        )
+        assert not bool((self.pinned > 0).any()), (
+            "prompt pinning (B2) is only supported on the fused path "
+            "(PERSONAPLEX_TURBOQUANT_FUSED=1); the phase-1 dequant->SDPA path "
+            "would attend the pinned prefix at extrapolated RoPE distances."
         )
         eo = self.end_offset[:1]  # representative scalar-shaped offset
 
@@ -305,10 +348,17 @@ class TurboQuantRingKVCache:
         assert T == 1, "streaming write_only handles one frame at a time (T==1)"
         k_codes, k_nrm, _ = self._encode(k, self.cb_k, self.bnd_k)  # (B,H,1,Dh),(B,H,1)
         v_codes, v_nrm, _ = self._encode(v, self.cb_v, self.bnd_v)
-        # Per-slot write position: each slot writes at its OWN ring position
-        # (end_offset[b] % C). When the batch is synchronized these are all equal
-        # and this matches the previous shared index_copy_ exactly.
-        write_pos = self.end_offset % self.capacity                # (B,)
+        # Per-slot write position: each slot writes at its OWN ring position.
+        # With a pinned prefix P_b (B2), frames at offset o >= P_b roll within the
+        # sub-ring [P_b, capacity) of size W_b = capacity - P_b, so the prompt
+        # slots [0, P_b) are never overwritten. With P_b == 0 this reduces to the
+        # plain per-slot ring `end_offset % capacity` (identical: P + (o - 0) % C).
+        # pin_slot guarantees end_offset >= pinned, so the remainder operand is
+        # never negative. When the batch is synchronized and unpinned these are
+        # all equal and match the original shared index_copy_ exactly.
+        P = self.pinned                                             # (B,)
+        write_pos = P + torch.remainder(self.end_offset - P,
+                                        self.capacity - P)          # (B,)
         bidx = torch.arange(B, device=write_pos.device)
         self.codes[0][bidx, :, write_pos, :] = k_codes[:, :, 0, :]
         self.codes[1][bidx, :, write_pos, :] = v_codes[:, :, 0, :]

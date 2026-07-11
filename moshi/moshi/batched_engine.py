@@ -274,6 +274,18 @@ class BatchedEngine:
             if slot.state == SlotState.PRIMING:
                 slot.prime_cursor += 1
                 if slot.prime_cursor >= len(slot.prime_script):
+                    # B2: lock the just-fed prompt (voice + recipe text) as this
+                    # slot's permanent KV prefix so it survives past ~context
+                    # frames (~4 min). No-op unless PERSONAPLEX_PIN_PROMPT=1.
+                    # Runs on the event loop after the step returned, so it never
+                    # races with _compute (same guarantee as _process_joins).
+                    ctx = getattr(self.lm_gen.lm_model, "context", None)
+                    if ctx is None or len(slot.prime_script) < ctx:
+                        self.lm_gen.pin_slot(slot.idx)
+                    else:
+                        print(f"[engine] slot {slot.idx}: prime script "
+                              f"({len(slot.prime_script)} frames) >= context "
+                              f"({ctx}); prompt NOT pinned")
                     slot.state = SlotState.ACTIVE
                     slot.frames_since_join = 0
 
