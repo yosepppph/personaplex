@@ -58,12 +58,15 @@ async def fake_user(engine, name, talk_seconds, sample_rate, frame_size,
     async def drain():
         nonlocal out_received
         slot = engine.slots[idx]
+        # Keep draining until cancelled (when the user leaves). Since Phase 3a a
+        # join spends ~1 s PRIMING (output suppressed) before its first frame, so
+        # returning on the first quiet second would miss the whole session.
         while True:
             try:
                 await asyncio.wait_for(slot.out_q.get(), timeout=1.0)
                 out_received += 1
             except asyncio.TimeoutError:
-                return
+                continue
 
     drain_task = asyncio.create_task(drain())
     # Stream frames at the real-time cadence (a quiet-ish signal).
