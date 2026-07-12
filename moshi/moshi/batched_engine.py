@@ -288,6 +288,11 @@ class BatchedEngine:
                               f"({ctx}); prompt NOT pinned")
                     slot.state = SlotState.ACTIVE
                     slot.frames_since_join = 0
+                    pin = os.environ.get("PERSONAPLEX_PIN_PROMPT", "0") == "1"
+                    print(f"[engine] slot {slot.idx}: primed "
+                          f"({len(slot.prime_script)} frames, "
+                          f"~{len(slot.prime_script) / self.frame_rate:.1f}s) -> ACTIVE"
+                          f"{' [prompt pinned]' if pin else ''}")
 
     # ---------------- tick split: gather (loop) / compute (thread) / scatter (loop) ----------------
 

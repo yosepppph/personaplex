@@ -206,12 +206,17 @@ class EngineServer:
 
         async def out_loop():
             # Drain this slot's engine output: PCM -> opus, text token -> piece.
+            first_frame = True
             while not close:
                 try:
                     pcm_out, text_token = await asyncio.wait_for(
                         slot.out_q.get(), timeout=0.5)
                 except asyncio.TimeoutError:
                     continue
+                if first_frame:
+                    clog.log("info", "first output frame from engine "
+                                     "(priming done, audio flowing)")
+                    first_frame = False
                 opus_writer.append_pcm(pcm_out)
                 if text_token is not None and text_token not in (0, 3):
                     piece = self.text_tokenizer.id_to_piece(text_token).replace("▁", " ")
