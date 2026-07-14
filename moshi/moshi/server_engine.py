@@ -46,7 +46,7 @@ import sentencepiece
 import sphn
 import torch
 
-from .batched_engine import BatchedEngine
+from .batched_engine import BatchedEngine, SlotState
 from .models import loaders
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
@@ -225,12 +225,29 @@ class EngineServer:
                 if len(msg) > 0:
                     await ws.send_bytes(b"\x01" + msg)
 
+        async def keepalive_loop():
+            # The stock web client closes the socket after 10 s without ANY
+            # server message (useSocket.ts inactivity watchdog), but a joining
+            # slot is mute for len(prime_script) ticks while its prompt is
+            # force-fed (~12 s for a ~140-token recipe, plus the voice span
+            # when a voice prompt is set). Send a protocol ping (0x06, decoded
+            # and ignored by the client) every 3 s during priming so the
+            # watchdog stays quiet. Once ACTIVE the slot emits audio every
+            # tick, so this just idles until the connection ends (it must not
+            # return on its own: handle_chat tears everything down on the
+            # FIRST completed task).
+            while not close:
+                if slot.state in (SlotState.PENDING, SlotState.PRIMING):
+                    await ws.send_bytes(b"\x06")
+                await asyncio.sleep(3.0)
+
         await ws.send_bytes(b"\x00")  # handshake: client may start streaming
         clog.log("info", "sent handshake")
         tasks = [
             asyncio.create_task(recv_loop()),
             asyncio.create_task(feed_loop()),
             asyncio.create_task(out_loop()),
+            asyncio.create_task(keepalive_loop()),
         ]
         try:
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
