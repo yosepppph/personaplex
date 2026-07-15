@@ -89,7 +89,8 @@ class EngineServer:
     def __init__(self, engine: BatchedEngine,
                  text_tokenizer: sentencepiece.SentencePieceProcessor,
                  voice_mimi=None,
-                 voice_prompt_dir: Optional[str] = None):
+                 voice_prompt_dir: Optional[str] = None,
+                 fallback_voice_wav: Optional[str] = None):
         self.engine = engine
         self.text_tokenizer = text_tokenizer
         self.sample_rate = engine.sample_rate
@@ -99,6 +100,11 @@ class EngineServer:
         # `voice_prompt_dir` holds the .wav voice clips. Codes are cached per voice.
         self.voice_mimi = voice_mimi
         self.voice_prompt_dir = voice_prompt_dir
+        # When a requested voice has no .wav (e.g. the stock web UI's packaged
+        # NATF0.pt names), fall back to this clip instead of dropping voice
+        # conditioning entirely (an unconditioned slot starts with a random
+        # voice). A per-name .wav in voice_prompt_dir still takes precedence.
+        self.fallback_voice_wav = fallback_voice_wav
         self._voice_codes_cache: dict = {}
 
     def _get_voice_codes(self, voice_name: str):
@@ -116,6 +122,16 @@ class EngineServer:
             if cand.endswith(".wav") and os.path.exists(cand):
                 wav_path = cand
                 break
+        if wav_path is None and self.fallback_voice_wav:
+            fb = self.fallback_voice_wav
+            if not os.path.isabs(fb):
+                fb = os.path.join(self.voice_prompt_dir, fb)
+            if os.path.exists(fb):
+                logger.info(f"voice '{voice_name}': no .wav found; using the "
+                            f"fallback voice clip {fb}")
+                wav_path = fb
+            else:
+                logger.warning(f"fallback voice clip not found: {fb}")
         if wav_path is None:
             logger.warning(
                 f"voice '{voice_name}': no .wav found in {self.voice_prompt_dir}; "
@@ -301,6 +317,12 @@ def main():
                              "Omit to disable voice prompts (default voice for everyone). "
                              "NOTE: must be .wav clips -- the packaged .pt embeddings are "
                              "not usable by the batched engine.")
+    parser.add_argument("--fallback-voice-wav", type=str,
+                        help="Voice clip to use when the requested ?voice_prompt= has no "
+                             ".wav in --voice-prompt-dir (e.g. the stock web UI's packaged "
+                             "NATF0.pt picker names). Relative names resolve inside "
+                             "--voice-prompt-dir. Without it, unresolvable voices get NO "
+                             "voice conditioning (the slot starts with a random voice).")
     args = parser.parse_args()
 
     if os.environ.get("PERSONAPLEX_TURBOQUANT_KV") != "1" or \
@@ -355,7 +377,8 @@ def main():
 
     server = EngineServer(engine, text_tokenizer,
                           voice_mimi=voice_mimi,
-                          voice_prompt_dir=args.voice_prompt_dir)
+                          voice_prompt_dir=args.voice_prompt_dir,
+                          fallback_voice_wav=args.fallback_voice_wav)
 
     app = web.Application()
 
